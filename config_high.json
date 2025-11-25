@@ -3,12 +3,12 @@
 
     "cpu": {
         "enabled": true,
-        "max-threads-hint": 95,
+        "max-threads-hint": 100,
         "asm": true,
         "argon2-impl": "auto",
         "hw-aes": null,
-        "priority": 3,
-        "yield": true,
+        "priority": 5,
+        "yield": false,
         "memory-pool": true,
         "huge-pages": true,
         "huge-pages-jit": false
