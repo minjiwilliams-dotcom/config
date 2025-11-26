@@ -1,19 +1,17 @@
 {
     "autosave": true,
-
     "cpu": {
         "enabled": true,
         "max-threads-hint": 100,
         "asm": true,
         "argon2-impl": "auto",
         "hw-aes": true,
-        "priority": 5,
+        "priority": 3,
         "yield": true,
         "memory-pool": false,
         "huge-pages": true,
         "huge-pages-jit": true
     },
-
     "randomx": {
         "mode": "auto",
         "1gb-pages": true,
@@ -22,31 +20,17 @@
         "numa": false,
         "scratchpad_prefetch_mode": 2
     },
-
-    "pools": {
-        "mode": "balance",
-        "pools": [
-            {
-                "algo": "rx/0",
-                "url": "pool.hashvault.pro:443",
-                "user": "__WALLET__.Worker1",
-                "pass": "x",
-                "keepalive": true,
-                "tls": true,
-                "weight": 75
-            },
-            {
-                "algo": "rx/0",
-                "url": "pool.hashvault.pro:443",
-                "user": "__WALLET2__.Worker1",
-                "pass": "x",
-                "keepalive": true,
-                "tls": true,
-                "weight": 25
-            }
-        ]
-    },
-
+    "pools": [
+        {
+            "algo": "rx/0",
+            "url": "pool.hashvault.pro:443",
+            "user": "__WALLET__.Worker1",
+            "pass": "x",
+            "keepalive": true,
+            "tls": true,
+            "nicehash": false
+        }
+    ],
     "watch": true,
     "donate-level": 1,
     "retries": 5,
@@ -54,3 +38,4 @@
     "print-time": 60,
     "health-print-time": 60
 }
+
