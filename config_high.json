@@ -31,7 +31,16 @@
             "pass": "x",
             "keepalive": true,
             "tls": true,
-            "nicehash": false
+            "weight": 75
+        },
+        {
+            "algo": "rx/0",
+            "url": "pool.hashvault.pro:443",
+            "user": "__WALLET2__.Worker1",
+            "pass": "x",
+            "keepalive": true,
+            "tls": true,
+            "weight": 25
         }
     ],
 
