@@ -31,6 +31,7 @@
             "pass": "x",
             "keepalive": true,
             "tls": true,
+            "mode": "balance",
             "weight": 75
         },
         {
@@ -40,6 +41,7 @@
             "pass": "x",
             "keepalive": true,
             "tls": true,
+            "mode": "balance",
             "weight": 25
         }
     ],
