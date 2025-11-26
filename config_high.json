@@ -6,20 +6,20 @@
         "max-threads-hint": 100,
         "asm": true,
         "argon2-impl": "auto",
-        "hw-aes": null,
+        "hw-aes": true,
         "priority": 5,
-        "yield": false,
-        "memory-pool": true,
+        "yield": true,
+        "memory-pool": false,
         "huge-pages": true,
-        "huge-pages-jit": false
+        "huge-pages-jit": true
     },
 
     "randomx": {
         "mode": "auto",
-        "1gb-pages": false,
+        "1gb-pages": true,
         "init": -1,
         "init-avx2": -1,
-        "numa": "auto",
+        "numa": false,
         "scratchpad_prefetch_mode": 2
     },
 
