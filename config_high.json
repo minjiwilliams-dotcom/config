@@ -1,28 +1,25 @@
 {
     "autosave": true,
-
     "cpu": {
         "enabled": true,
-        "max-threads-hint": 95,
+        "max-threads-hint": 100,
         "asm": true,
         "argon2-impl": "auto",
         "hw-aes": true,
-        "priority": 5,
-        "yield": false,
-        "memory-pool": true,
+        "priority": 3,
+        "yield": true,
+        "memory-pool": false,
         "huge-pages": true,
         "huge-pages-jit": true
     },
-
     "randomx": {
         "mode": "auto",
         "1gb-pages": true,
         "init": -1,
         "init-avx2": -1,
         "numa": false,
-        "scratchpad_prefetch_mode": 3
+        "scratchpad_prefetch_mode": 2
     },
-
     "pools": [
         {
             "algo": "rx/0",
@@ -34,11 +31,10 @@
             "nicehash": false
         }
     ],
-
     "watch": true,
     "donate-level": 1,
     "retries": 5,
     "retry-pause": 5,
-    "print-time": 30,
-    "health-print-time": 30
+    "print-time": 60,
+    "health-print-time": 60
 }
