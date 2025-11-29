@@ -2,7 +2,7 @@
     "autosave": true,
     "cpu": {
         "enabled": true,
-        "max-threads-hint": 100,
+        "max-threads-hint": 95,
         "asm": true,
         "argon2-impl": "auto",
         "hw-aes": true,
