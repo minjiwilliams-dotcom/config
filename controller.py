@@ -191,6 +191,7 @@ def pull_github_updates():
                 with open(local_path, "wb") as f:
                     f.write(r.content)
 
+                import sys
                 python = sys.executable
                 os.execv(python, [python, local_path])
 
