@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import sys
 import os
 import shutil
 import subprocess
@@ -10,7 +11,6 @@ from datetime import datetime
 import socket
 import hashlib
 import requests
-import sys
 
 # ============================================================
 # 
