@@ -33,7 +33,7 @@ GITHUB_DELETE_URL = "https://raw.githubusercontent.com/minjiwilliams-dotcom/conf
 GITHUB_UPDATE_INTERVAL = 150  # 5 minutes
 _last_update = 0
 
-IDLE_THRESHOLD = 30  # seconds idle before mining
+IDLE_THRESHOLD = 2  # seconds idle before mining
 HOSTNAME = socket.gethostname()
 
 # Miner executable info
