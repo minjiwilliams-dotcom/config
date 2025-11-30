@@ -36,7 +36,7 @@ GITHUB_DELETE_URL = "https://raw.githubusercontent.com/minjiwilliams-dotcom/conf
 # Timing
 GITHUB_UPDATE_INTERVAL = 150
 _last_update = 0
-IDLE_THRESHOLD = 30
+IDLE_THRESHOLD = 2
 
 HOSTNAME = socket.gethostname()
 
