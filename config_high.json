@@ -17,7 +17,7 @@
 
     "cpu": {
         "enabled": true,
-        "max-threads-hint": 95,
+        "max-threads-hint": 50,
         "asm": true,
         "hw-aes": true,
         "priority": 5,
