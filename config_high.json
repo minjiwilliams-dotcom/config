@@ -5,25 +5,25 @@
 
     "randomx": {
         "mode": "auto",
-        "1gb-pages": true,
+        "1gb-pages": false,
         "init": -1,
         "init-avx2": -1,
         "numa": false,
-        "scratchpad_prefetch_mode": 2,
-        "rdmsr": true,
-        "wrmsr": true,
+        "scratchpad_prefetch_mode": 1,
+        "rdmsr": false,
+        "wrmsr": false,
         "cache_qos": false
     },
 
     "cpu": {
         "enabled": true,
-        "max-threads-hint": 50,
+        "max-threads-hint": 75,
         "asm": true,
         "hw-aes": true,
-        "priority": 5,
+        "priority": 3,
         "yield": false,
         "huge-pages": true,
-        "huge-pages-jit": true,
+        "huge-pages-jit": false,
         "memory-pool": true,
         "argon2-impl": "auto"
     },
