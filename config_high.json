@@ -1,5 +1,5 @@
 {
-    "autosave": true,
+    "autosave": false,
     "background": false,
     "title": true,
 
@@ -24,8 +24,7 @@
         "yield": false,
         "huge-pages": true,
         "huge-pages-jit": false,
-        "memory-pool": true,
-        "argon2-impl": "auto"
+        "memory-pool": true
     },
 
     "pools": [
@@ -45,5 +44,5 @@
     "donate-level": 1,
     "print-time": 15,
     "health-print-time": 30,
-    "watch": true
+    "watch": false
 }
