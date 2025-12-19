@@ -35,7 +35,7 @@
             "user": "__WALLET__.Worker1",
             "pass": "x",
             "keepalive": true,
-            "tls": true,
+            "tls": false,
             "nicehash": false
         }
     ],
