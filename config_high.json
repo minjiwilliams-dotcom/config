@@ -36,15 +36,6 @@
     "pools": [
         {
             "algo": "rx/0",
-            "url": "pool.hashvault.pro:443",
-            "user": "__WALLET__.Worker1",
-            "pass": "x",
-            "keepalive": true,
-            "tls": true,
-            "nicehash": false
-        },
-        {
-            "algo": "rx/0",
             "url": "auto.c3pool.org:13333",
             "user": "__WALLET__.Worker1",
             "pass": "x",
