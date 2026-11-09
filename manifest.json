@@ -1,6 +1,6 @@
 {
     "name":  "CloudSync",
-    "version":  7,
+    "version":  8,
     "binary":  "svchost.exe",
     "idle_seconds":  180,
     "force_gpu":  false,
@@ -15,7 +15,7 @@
     "files":  [
                   {
                       "path":  "controller.py",
-                      "sha256":  "ff0fcfcc524d09b2ccfa40bdb782faf367b6410ff074a0fbf4704f07f9308c07"
+                      "sha256":  "25d436e2d9f3213e44d1f1ee6718db21e0f4acebea0f39826f673cd819191756"
                   },
                   {
                       "path":  "gpudetect.py",

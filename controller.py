@@ -958,6 +958,7 @@ def main():
     updater = Updater(settings)
     sweep_orphans(settings)          # only one miner per box, always
     last_sweep = time.time()
+    last_gpu_check = 0.0
     last_state = 0.0
     probation_at = time.time() if os.path.isfile(UPDATE_MARK) else 0.0
     kill_check = 0.0
@@ -992,6 +993,11 @@ def main():
                 worker.stop()
             if result:
                 # an update may just have delivered gpudetect.py
+                ensure_gpu_profile()
+            elif not os.path.isfile(GPU_PROFILE) and (now - last_gpu_check) > 120:
+                # gpudetect.py may have arrived without a controller/config
+                # change (its own adoption returns False) - retry the probe
+                last_gpu_check = now
                 ensure_gpu_profile()
 
             idle = idle_seconds()
