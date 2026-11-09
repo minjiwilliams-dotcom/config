@@ -1,49 +1,70 @@
 {
-    "autosave": true,
-    "background": false,
-    "title": true,
-
-    "randomx": {
-        "mode": "auto",
-        "1gb-pages": true,
-        "init": -1,
-        "init-avx2": -1,
-        "numa": false,
-        "scratchpad_prefetch_mode": 2,
-        "rdmsr": true,
-        "wrmsr": true,
-        "cache_qos": false
-    },
-
-    "cpu": {
-        "enabled": true,
-        "max-threads-hint": 50,
-        "asm": true,
-        "hw-aes": true,
-        "priority": 5,
-        "yield": false,
-        "huge-pages": true,
-        "huge-pages-jit": true,
-        "memory-pool": true,
-        "argon2-impl": "auto"
-    },
-
-    "pools": [
-        {
-            "algo": "rx/0",
-            "url": "pool.hashvault.pro:443",
-            "user": "__WALLET__.Worker1",
-            "pass": "x",
-            "keepalive": true,
-            "tls": true,
-            "nicehash": false
-        }
-    ],
-
-    "retries": 5,
-    "retry-pause": 5,
-    "donate-level": 1,
-    "print-time": 15,
-    "health-print-time": 30,
-    "watch": true
+  "api": {
+    "id": null,
+    "worker-id": null
+  },
+  "http": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 0,
+    "access-token": null,
+    "restricted": true
+  },
+  "autosave": false,
+  "background": false,
+  "colors": false,
+  "title": false,
+  "randomx": {
+    "mode": "auto",
+    "1gb-pages": false,
+    "rdmsr": true,
+    "wrmsr": true,
+    "cache_qos": false,
+    "numa": true,
+    "scratchpad_prefetch_mode": 1
+  },
+  "cpu": {
+    "enabled": true,
+    "huge-pages": false,
+    "huge-pages-jit": false,
+    "hw-aes": null,
+    "priority": 2,
+    "memory-pool": false,
+    "yield": false,
+    "asm": true,
+    "argon2-impl": null,
+    "max-threads-hint": 50,
+    "astrobwt-max-size": 550
+  },
+  "opencl": {
+    "enabled": false
+  },
+  "donate-level": 1,
+  "donate-over-proxy": 1,
+  "log-file": null,
+  "pools": [
+    {
+      "algo": "rx/0",
+      "coin": null,
+      "url": "pool.hashvault.pro:443",
+      "user": "__WALLET__.Worker1",
+      "pass": "x",
+      "rig-id": null,
+      "nicehash": false,
+      "keepalive": true,
+      "enabled": true,
+      "tls": true,
+      "tls-fingerprint": null,
+      "daemon": false,
+      "socks5": null,
+      "self-select": null
+    }
+  ],
+  "print-time": 30,
+  "health-print-time": 60,
+  "retries": 5,
+  "retry-pause": 5,
+  "syslog": false,
+  "watch": false,
+  "pause-on-active": 0
 }

