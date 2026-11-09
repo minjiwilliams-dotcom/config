@@ -697,12 +697,15 @@ class Updater(object):
         self.last = time.time()
 
         changed = []
+        failed = False
         for name, want in self._targets():
             local = os.path.join(BASE, name)
             try:
                 data = urllib.request.urlopen(self.s.update_url(name), timeout=30).read()
-            except Exception:
-                continue                      # not published: keep the local copy
+            except Exception as exc:
+                log("update download failed: %s (%s)" % (name, exc))
+                failed = True
+                continue
             if not data or len(data) < 40:
                 continue
             got = hashlib.sha256(data).hexdigest()
@@ -726,6 +729,9 @@ class Updater(object):
             changed.append(name)
             log("updated %s" % name)
 
+        if failed:
+            # a transient fetch failure must not cost 15 minutes: retry in 5
+            self.last = time.time() - UPDATE_INTERVAL + 300
         if "controller.py" in changed:
             atomic_write(UPDATE_MARK, json.dumps({"applied": time.time(), "attempts": 0}))
             return True
