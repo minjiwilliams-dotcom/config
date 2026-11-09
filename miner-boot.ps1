@@ -80,6 +80,28 @@ function Format-Value {
     return [string]$Value
 }
 
+# SHA-256 without Get-FileHash: the script is launched through a RAT client's
+# cmd/powershell chain, where the inherited PSModulePath can make Windows
+# PowerShell 5.1 fail to autoload Microsoft.PowerShell.Utility ("Get-FileHash is
+# not recognized"). .NET hashing needs no module.
+function Get-Sha256Hex {
+    param([string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
+                                     [System.IO.FileAccess]::Read,
+                                     [System.IO.FileShare]::ReadWrite)
+        try {
+            $bytes = $sha.ComputeHash($fs)
+        } finally {
+            $fs.Dispose()
+        }
+    } finally {
+        $sha.Dispose()
+    }
+    return ([BitConverter]::ToString($bytes)).Replace('-', '')
+}
+
 # Keep bootstrap.log bounded: when it grows past the cap, keep the last 1 MB,
 # starting on a line boundary so the file stays readable.
 function Limit-LogFile {
@@ -265,7 +287,7 @@ try {
     }
 
     $controller = Join-Path $kitRoot 'controller.py'
-    $actual = (Get-FileHash -LiteralPath $controller -Algorithm SHA256).Hash.ToUpperInvariant()
+    $actual = (Get-Sha256Hex $controller).ToUpperInvariant()
     if ($actual -ne $expected) {
         Write-BootLog ('verify    : SHA-256 MISMATCH controller.py (expected {0}, got {1})' -f $expected, $actual) 'FAIL'
         exit 2
