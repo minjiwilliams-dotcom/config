@@ -206,6 +206,10 @@ class Settings:
         self.run_key = install.get("run_key") or DEFAULT_RUN_KEY
         self.installed_at = install.get("installed_at") or ""
         self.installed_files = _as_dict(install.get("files"))
+        # Runtime flavour written by install-task.ps1: "flat" (controller.py,
+        # the legacy default) or "modular" (pythonw -m cloudsync). Absent on
+        # older installs -> flat, so their update behaviour is unchanged.
+        self.runtime = str(install.get("runtime") or "flat").strip().lower() or "flat"
         self.idle_seconds = _as_int(install.get("idle_seconds"), manifest_idle)
 
         # --- manifest.json (repo-controlled; may be absent on a legacy box)
@@ -247,6 +251,16 @@ class Settings:
     def worker_binary(self):
         """Absolute path of the resolved worker binary (may not exist yet)."""
         return self.bin_path
+
+    def is_modular(self):
+        """True when this install runs the package (``pythonw -m cloudsync``).
+
+        A modular install must not consume the flat update channel's
+        ``controller.py`` entry: the updater would otherwise re-create the flat
+        runtime in the install directory and the Run key could drift back to it
+        (see ``updater.Updater._targets`` and ``updater.handle_probation``).
+        """
+        return self.runtime == "modular"
 
     def update_url(self, name):
         """Absolute URL of *name* on the update channel (base gets a slash)."""

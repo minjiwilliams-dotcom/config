@@ -14,6 +14,10 @@ Mirrors the update half of ``F:\\Test Miner\\controller.py``:
 * ``handle_probation()`` rolls back a controller update that failed to get going
   (``update.json`` attempts >= 3 -> restore ``controller.py.prev``).
 * ``remote_kill()`` reads the channel's ``delete.txt`` kill switch.
+* Modular installs (``install.json`` ``"runtime": "modular"``, tasks run
+  ``pythonw -m cloudsync``) never consume the flat ``controller.py`` entry: it is
+  dropped from the target list and probation rollback is inert, so the update
+  channel cannot re-create the flat runtime (no drift back to flat).
 
 Nothing runs at import time.  The network fetch is injectable (``fetch``), so the
 whole updater can be exercised offline with a fake transport.
@@ -124,6 +128,7 @@ class Updater:
         self.update_interval = float(update_interval)
         self.last = 0.0
         self._warned = False
+        self._skipped_logged = False
 
     def __repr__(self):
         return "Updater(%r, last=%r)" % (self.install_dir, self.last)
@@ -149,6 +154,33 @@ class Updater:
     def _legacy_update(self):
         return bool(getattr(self.settings, "legacy_update", False))
 
+    def _modular(self):
+        """True when the install runs the package instead of ``controller.py``."""
+        checker = getattr(self.settings, "is_modular", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        runtime = getattr(self.settings, "runtime", "flat")
+        return str(runtime or "flat").strip().lower() == "modular"
+
+    def _filter_targets(self, targets):
+        """Drop the flat ``controller.py`` target when running modular.
+
+        Pulling it would leave a flat controller in a modular install directory,
+        which the Run-key resolution then treats as the flat runtime - the drift
+        this guard exists to prevent. Logged once, like the other low-volume
+        updater warnings.
+        """
+        if not self._modular():
+            return targets
+        kept = [item for item in targets if item[0] != UPDATE_TARGET]
+        if len(kept) != len(targets) and not self._skipped_logged:
+            self._skipped_logged = True
+            self._log("update: modular runtime - controller.py skipped")
+        return kept
+
     def _fetch_bytes(self, name, timeout=30):
         return self._fetch(self._update_url(name), timeout)
 
@@ -166,7 +198,7 @@ class Updater:
                 if name and sha and not sha.startswith("__"):
                     targets.append((name, sha))
             if targets:
-                return targets
+                return self._filter_targets(targets)
             self._log("manifest.json has no usable file list")
         except Exception:
             if not self._legacy_update():
@@ -178,7 +210,7 @@ class Updater:
                         '"legacy_update": true in manifest.json.')
                 return []
             self._log("no manifest.json - legacy direct-update mode")
-        return [(name, None) for name in DEFAULT_UPDATE_FILES]
+        return self._filter_targets([(name, None) for name in DEFAULT_UPDATE_FILES])
 
     # -- the update step ----------------------------------------------------
 
@@ -254,6 +286,28 @@ class Updater:
 # ---------------------------------------------------------------------------
 
 
+def _is_modular_install(base, settings=None):
+    """True when *base* runs the package (``install.json`` ``runtime: modular``).
+
+    Accepts an already-built Settings (``is_modular()``), a duck-typed object
+    with ``runtime``, or nothing - in which case the install's ``install.json``
+    is read (the supervisor's ``handle_probation(install_dir)`` call shape).
+    """
+    checker = getattr(settings, "is_modular", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    runtime = getattr(settings, "runtime", None)
+    if runtime is not None:
+        return str(runtime or "flat").strip().lower() == "modular"
+    info = read_json(os.path.join(base, "install.json"), None)
+    if isinstance(info, dict):
+        return str(info.get("runtime") or "flat").strip().lower() == "modular"
+    return False
+
+
 def handle_probation(install_dir=None, *, settings=None, log=None,
                      target=UPDATE_TARGET, mark=UPDATE_MARK,
                      attempts=PROBATION_ATTEMPTS):
@@ -262,9 +316,15 @@ def handle_probation(install_dir=None, *, settings=None, log=None,
     ``update.json`` carries an ``attempts`` counter; each start increments it and
     at *attempts* the previous controller (``<target>.prev``) is restored and the
     marker removed, exactly like ``controller.handle_probation``.
+
+    Inert on a modular install: there is no flat ``controller.py`` to roll back,
+    and restoring a ``.prev`` copy would re-create the flat runtime.
     """
     log = _normalise_logger(log)
     base = _install_dir(settings, install_dir)
+    if _is_modular_install(base, settings):
+        log("update: modular runtime - probation rollback inert")
+        return False
     marker_path = os.path.join(base, mark)
     marker = read_json(marker_path, None)
     if not isinstance(marker, dict):
