@@ -446,7 +446,12 @@ class Supervisor:
     # -- state / hooks ------------------------------------------------------
 
     def build_state(self):
-        """Build the state.json payload for this tick (pure, no write)."""
+        """Build the state.json payload for this tick (pure, no write).
+
+        Telemetry read by :meth:`_read_telemetry` is published here through
+        ``build_payload``: ``hashrate``/``accepted``/``rejected``/``gpu_ready``
+        (TEST-REPORT D2).
+        """
         return build_payload(self.settings, self.worker, self.wanted,
                              self.idle, self.cpu_cap_pct)
 
@@ -493,6 +498,27 @@ class Supervisor:
             return False
         self._debug("run key check: ok=%s" % bool(outcome))
         return bool(outcome)
+
+    def _read_telemetry(self):
+        """Ingest this tick's worker telemetry (TEST-REPORT D2).
+
+        The heartbeat used to publish ``hashrate: "n/a"`` forever because nothing
+        called ``Worker.read_telemetry()``. Reading once per tick keeps
+        ``build_state()`` current without waiting for the 30 s state cycle; the
+        worker's source (a log-tail read) is cheap. A worker without the method
+        (test doubles, future transports) or a failing source never aborts the
+        tick.
+        """
+        reader = getattr(self.worker, "read_telemetry", None)
+        if not callable(reader):
+            return False
+        try:
+            reader()
+            return True
+        except Exception as exc:
+            self._debug("telemetry read failed [%s]: %r"
+                        % (_owner_tag(exc, "telemetry"), exc))
+            return False
 
     def _run_hooks(self, now, actions):
         if self._awake is not None:
@@ -606,6 +632,7 @@ class Supervisor:
                     actions.append("dwell")
 
         self._maybe_recover(actions)
+        self._read_telemetry()          # D2: feed build_state() before the write
         self._run_hooks(now, actions)
         self._was_alive = self.worker.alive()
         self.last_actions = actions
@@ -695,7 +722,7 @@ def main(argv=None):
     install keeps running even if one optional recovery path is missing.
     """
     _ = argv
-    from .config.settings import Settings
+    from .config.settings import Settings, resolve_install_dir
     from .core.logging import logger_for
     from .miner.worker import Worker, sweep_orphans
     from .platform import gpu, mutex, power
@@ -705,7 +732,11 @@ def main(argv=None):
     if lock is None:
         return 0
 
-    settings = Settings()
+    # D1: resolve the install directory deterministically - an explicit dir,
+    # else cwd when it is the install dir (holds install.json), else the
+    # per-user default, else the machine-wide default. Passed in explicitly so
+    # main() never depends on Settings()' fallback again.
+    settings = Settings.from_install(resolve_install_dir())
     # Raw writer for modules that name their own lines; this module's lines go
     # through the supervisor-named writer so every line carries its owner.
     log_writer = logger_for(settings.install_dir).write

