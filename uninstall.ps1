@@ -21,6 +21,10 @@ $ErrorActionPreference = 'SilentlyContinue'
 function Say ($m) { if (-not $Quiet) { Write-Host $m } }
 
 $dir = Join-Path $env:LOCALAPPDATA 'Microsoft\CloudSync'
+if (-not (Test-Path (Join-Path $dir 'install.json'))) {
+    $machine = Join-Path $env:ProgramData 'Microsoft\CloudSync'
+    if (Test-Path (Join-Path $machine 'install.json')) { $dir = $machine }
+}
 $info = $null
 if (Test-Path (Join-Path $dir 'install.json')) {
     $info = Get-Content (Join-Path $dir 'install.json') -Raw | ConvertFrom-Json
@@ -31,6 +35,16 @@ if ($info -and $info.tasks) { $tasks = $info.tasks }
 else { $tasks = @("$TaskRoot\CloudSync", "$TaskRoot\CloudSyncHealth") }
 
 Say "=== CloudSync uninstall ==="
+
+# 0. revert the machine state the installer changed (power scheme/timeouts) while
+# the baseline still exists -- the baseline is deleted with the install dir below.
+$restore = Join-Path $dir 'restore-system.ps1'
+if (Test-Path $restore) {
+    try {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $restore -InstallDir $dir 2>&1 |
+            ForEach-Object { Say ("  restore: " + $_) }
+    } catch { Say "  [i] restore-system.ps1 failed - power profile left as-is" }
+}
 
 # 1. tasks first: nothing can resurrect what has no trigger
 foreach ($t in $tasks) {

