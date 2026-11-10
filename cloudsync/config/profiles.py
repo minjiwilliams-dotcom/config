@@ -70,6 +70,8 @@ class Profile(Mapping):
 PROFILES = {
     "full": Profile("full", hint=50, priority=2, yield_=False, gpu=True),
     "trickle": Profile("trickle", hint=25, priority=1, yield_=True, gpu=False),
+    # headless/session-0 only: every thread, no yield. Selected by the supervisor
+    "max": Profile("max", hint=100, priority=2, yield_=False, gpu=True),
 }
 
 

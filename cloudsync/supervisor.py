@@ -281,6 +281,8 @@ class Supervisor:
             return idle < threshold
 
     def _select_profile(self, idle, active):
+        if getattr(self, "_session0", False) and "max" in self.profiles:
+            return "max"
         try:
             name = choose_profile(idle, active, self.idle_threshold)
         except TypeError:
