@@ -26,7 +26,7 @@ from ..platform import winapi
 __all__ = [
     "now", "monotonic", "elapsed", "timestamp",
     "idle_seconds", "on_battery", "on_ac_power", "power_status",
-    "total_ram_gb", "is_admin",
+    "total_ram_gb", "is_admin", "session_id",
 ]
 
 # SYSTEM_POWER_STATUS.BatteryFlag bit: the machine has no system battery.
@@ -120,3 +120,14 @@ def total_ram_gb(default=8.0):
 def is_admin():
     """True when the process token is elevated (local administrator)."""
     return winapi.is_admin()
+
+
+def session_id():
+    """Terminal-services session ID of this process (``None`` when unavailable).
+
+    Session 0 is the non-interactive services session: a controller started by a
+    headless boot task (SYSTEM) reports 0, where ``GetLastInputInfo`` cannot see a
+    real user. The supervisor treats the machine as idle in that case. On a
+    non-Windows host this returns ``None``.
+    """
+    return winapi.session_id()

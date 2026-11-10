@@ -40,7 +40,7 @@ import time
 from . import lifecycle
 from .config.profiles import PROFILES, choose_profile
 from .config.settings import DEFAULT_IDLE_SECONDS
-from .core.clock import idle_seconds, on_battery
+from .core.clock import idle_seconds, on_battery, session_id
 from .core.diagnostics import UNKNOWN, classify
 from .core.state import build_payload, write as write_state
 
@@ -151,6 +151,17 @@ class Supervisor:
         self.run_key_interval = float(run_key_interval)
         self.tick_seconds = float(tick_seconds)
 
+        # Session 0 = the non-interactive services session (headless boot task
+        # running as SYSTEM). GetLastInputInfo cannot report a user there, so the
+        # idle gate would wrongly look "active" and cap the worker; treat the
+        # machine as idle instead (full profile, no CPU cap).
+        try:
+            self._session0 = (session_id() == 0)
+        except Exception:
+            self._session0 = False
+        if self._session0:
+            self._log("session 0 detected - full profile, no CPU cap")
+
         self.worker = self._resolve_worker(worker, worker_factory)
 
         # --- observable state (also what state.json publishes) ------------
@@ -241,7 +252,26 @@ class Supervisor:
         except Exception:
             return True
 
+    def _decision_idle(self, idle):
+        """Idle value used for profile/cap decisions.
+
+        In session 0 there is no interactive user, so the value is treated as
+        "away" (at least one second past the idle threshold) even when the input
+        probe reports 0 - otherwise every tick would pick the trickle profile and
+        cap the worker at ``active_pct``.
+        """
+        if not getattr(self, "_session0", False):
+            return idle
+        try:
+            threshold = float(self.idle_threshold)
+        except (TypeError, ValueError):
+            threshold = float(DEFAULT_IDLE_SECONDS)
+        return max(threshold + 1.0, float(idle))
+
     def _read_user_active(self, idle):
+        if getattr(self, "_session0", False):
+            # No interactive desktop exists to be active on.
+            return False
         threshold = self.idle_threshold
         try:
             return bool(user_active(threshold))
@@ -416,6 +446,8 @@ class Supervisor:
         return True
 
     def _apply_cap(self, now, idle, actions):
+        # Session 0: treat the machine as away so the cap stays at 100 %.
+        idle = self._decision_idle(idle)
         if idle >= self.idle_threshold:
             self._active_since = 0.0
             cap = 100
@@ -569,7 +601,8 @@ class Supervisor:
         mains = self._read_mains()
         self.wanted = bool(mains)
         active = self._read_user_active(idle)
-        profile = self._select_profile(idle, active)
+        # Session 0 has no real user: decisions use an "away" idle value.
+        profile = self._select_profile(self._decision_idle(idle), active)
         self.profile = profile
 
         job_ok = bool(getattr(self.worker, "job_ok", False))

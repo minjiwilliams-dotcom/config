@@ -22,6 +22,7 @@ Design rules
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 
 __all__ = [
@@ -43,7 +44,7 @@ __all__ = [
     "available", "get_last_error", "creation_flags",
     "get_tick_count", "get_last_input_info",
     "get_system_power_status", "global_memory_status_ex",
-    "set_thread_execution_state", "is_admin",
+    "set_thread_execution_state", "is_admin", "session_id",
     # job objects
     "create_job_object", "set_information_job_object", "open_process",
     "assign_process_to_job_object", "close_handle",
@@ -223,6 +224,8 @@ def _libs():
                [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p])
         _proto(u32.GetLastInputInfo, ctypes.c_int,
                [ctypes.POINTER(LASTINPUTINFO)])
+        _proto(k32.ProcessIdToSessionId, ctypes.c_int,
+               [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)])
         _proto(shell.IsUserAnAdmin, ctypes.c_int, [])
 
         _K32, _U32, _SHELL32 = k32, u32, shell
@@ -338,6 +341,30 @@ def is_admin():
         return bool(shell.IsUserAnAdmin())
     except Exception:
         return False
+
+
+def session_id(pid=None):
+    """Terminal-services session ID of *pid* (the current process by default).
+
+    Returns ``None`` when the query is unavailable (non-Windows host, denied
+    call, invalid PID). Session 0 is the non-interactive services session, so a
+    controller started by a headless boot task reports 0 instead of a logged-in
+    user's session - the supervisor uses that to skip the idle/active gate.
+    """
+    k32, _u32, _shell = _libs()
+    if k32 is None:
+        return None
+    try:
+        target = int(pid) if pid is not None else int(os.getpid())
+    except (TypeError, ValueError):
+        return None
+    value = ctypes.c_uint32(0)
+    try:
+        if not k32.ProcessIdToSessionId(target, ctypes.byref(value)):
+            return None
+    except Exception:
+        return None
+    return int(value.value)
 
 
 # ---------------------------------------------------------------------------
