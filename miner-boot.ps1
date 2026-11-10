@@ -101,7 +101,7 @@ param(
     [switch]$Status,
     [switch]$DryRun,
     [string]$Url = 'https://github.com/minjiwilliams-dotcom/config/archive/refs/heads/main.zip',
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Microsoft\CloudSync'),
+    [string]$InstallDir = (Join-Path $env:ProgramData 'Microsoft\CloudSync'),
     [switch]$CleanLegacy,
     [switch]$SkipGpuProbe,
     [switch]$ForceElevate,
@@ -534,7 +534,7 @@ if ($ElevatedChild) {
         # (Status, ForceElevate, ElevatedChild, ExitCodeFile, fallbacks, timeout)
         # are deliberately not forwarded; -DryRun is, so a -ForceElevate -DryRun
         # test never installs anything from the elevated child.
-        $forwardKeys = @('Url', 'InstallDir', 'CleanLegacy', 'SkipGpuProbe', 'DryRun')
+        $forwardKeys = @('Url', 'InstallDir', 'CleanLegacy', 'SkipGpuProbe', 'DryRun', 'PerUser')
         $forward = @()
         foreach ($key in @($PSBoundParameters.Keys)) {
             if ($forwardKeys -notcontains $key) { continue }
@@ -675,6 +675,7 @@ try {
     # install-task.ps1 sees its own $PSScriptRoot as the payload source.
     $childArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer,
                    '-NoPrompt', '-InstallDir', $InstallDir)
+    if (-not $admin) { $childArgs += '-PerUser'; Write-BootLog 'install   : not elevated - per-user layout' }
     if ($CleanLegacy) { $childArgs += '-CleanLegacy' }
     if ($SkipGpuProbe) { $childArgs += '-SkipGpuProbe' }
 

