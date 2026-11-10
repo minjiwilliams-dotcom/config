@@ -637,7 +637,10 @@ class Supervisor:
                     # choose_profile() result - the reference referenced an
                     # undefined ``profile`` here and spun on NameError.  A job
                     # object keeps the config at "full" (the CPU cap throttles).
-                    if job_ok:
+                    if getattr(self, "_session0", False):
+                        # no interactive user: run the selected profile (max)
+                        start_profile = profile
+                    elif job_ok:
                         start_profile = "full"
                     else:
                         start_profile = profile
