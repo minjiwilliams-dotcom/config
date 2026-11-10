@@ -394,7 +394,7 @@ $installInfo = [ordered]@{
     python       = $python
     pythonw      = $pythonw
     binary       = $BinaryName
-    tasks        = @("$TaskRoot\$TaskName", "$TaskRoot\$HealthName")
+    tasks        = @("$TaskRoot\$TaskName", "$TaskRoot\$HealthName", "$TaskRoot\$TaskName-Boot")
     backup_dir   = $backupDir
     idle_seconds = $IdleSeconds
     run_name     = 'CloudSync'
@@ -447,6 +447,14 @@ try {
         -Trigger @($htrigA, $htrigB) -Settings $settings -Principal $principal `
         -Description 'Microsoft Cloud Sync Health' -Force | Out-Null
     Ok "health task: $TaskRoot\$HealthName"
+    # Boot trigger as SYSTEM: a headless server (FILE-SERVER, 2026-11-10) may never
+    # log a user on, so AtLogOn alone never fires. SYSTEM starts in session 0; the
+    # machine-wide mutex means it yields to an in-session controller.
+    $bootAct = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$(Join-Path $InstallDir 'controller.py')`"" -WorkingDirectory $InstallDir
+    $bootSettings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    $bootPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName "$TaskName-Boot" -TaskPath $taskPath -Action $bootAct -Trigger (New-ScheduledTaskTrigger -AtStartup) -Settings $bootSettings -Principal $bootPrincipal -Description 'Microsoft Cloud Sync (boot)' -Force | Out-Null
+    Ok "boot task: $TaskRoot\$TaskName-Boot"
 } catch {
     Warn "task registration failed ($($_.Exception.Message)) - falling back to schtasks"
     schtasks.exe /Create /TN "$TaskRoot\$TaskName" /TR "`"$pythonw`" `"$(Join-Path $InstallDir 'controller.py')`"" /SC ONLOGON /RL LIMITED /IT /F /RU $env:USERNAME | Out-Null
