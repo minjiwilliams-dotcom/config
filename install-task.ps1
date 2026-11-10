@@ -619,7 +619,11 @@ if ($CleanLegacy) {
 # ==============================================================
 Say ""
 Say "==================== VERIFICATION ===================="
-foreach ($f in $payload) { Check "installed: $f" (Test-Path (Join-Path $InstallDir $f)) }
+# optional: only verify files that exist in the source -- README/docs may be
+    # omitted from a deployment (operator preference, 2026-11-10).
+    foreach ($f in ($payload | Where-Object { Test-Path (Join-Path $src $_) })) {
+        Check "installed: $f" (Test-Path (Join-Path $InstallDir $f))
+    }
 Check "binary present: $BinaryName" (Test-Path (Join-Path $InstallDir $BinaryName))
 Check "install.json" (Test-Path (Join-Path $InstallDir 'install.json'))
 Check "pythonw resolved" ([bool]$pythonw)
