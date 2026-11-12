@@ -108,25 +108,28 @@ if (-not (Test-Path $src)) { $src = (Get-Location).Path }
 Say "[+] source: $src"
 
 $payload = @(
-    'controller.py', 'gpudetect.py', 'config_high.json', 'manifest.json',
-    # NOTE: uninstall.ps1 and all documentation are deliberately NOT deployed.
-    # uninstall.ps1 resolves the install dir itself, so the operator runs it
-    # from the kit; README/WORKFLOW are for us, not for the target machine.
+    # modular runtime only: controller.py and gpudetect.py (the flat pair) are
+    # no longer deployed. config_high.json is still required - the package
+    # loads it as the worker config template.
+    'config_high.json', 'gpudetect.py', 'manifest.json',
     'wallet.txt', 'watchdog.ps1', 'install-task.ps1',
     'restore-system.ps1', 'harden.ps1', 'camo.ps1', 'check-updates.ps1',
     'REMOTE.cmd'
 )
 
 # ---- runtime selection ------------------------------------------------------
-# Same additive approach as the published repo installer: the modular package is
-# copied only when the source tree has one. A source tree without cloudsync\
-# installs the flat controller.py layout exactly as before.
+# This kit ships the modular runtime ONLY. The flat controller.py layout is
+# retired: a kit without cloudsync\__main__.py is a packaging error, not a
+# reason to silently install the old layout.
 $packageSrc = Join-Path $src 'cloudsync'
 $modular = Test-Path -LiteralPath (Join-Path $packageSrc '__main__.py')
 $runtime = if ($modular) { 'modular' } else { 'flat' }
-if ($modular) { Say "[+] runtime: modular (pythonw -m cloudsync)" }
-elseif (Test-Path -LiteralPath $packageSrc) { Warn "cloudsync\ present but no __main__.py - using the flat runtime" }
-else { Say "[+] runtime: flat (controller.py)" }
+if ($modular) {
+    Say "[+] runtime: modular (pythonw -m cloudsync)"
+} else {
+    Bad "no cloudsync\__main__.py in $src - this kit is modular-only"
+    exit 1
+}
 
 # ==============================================================
 # 2. python

