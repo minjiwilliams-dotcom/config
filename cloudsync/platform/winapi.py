@@ -37,6 +37,7 @@ __all__ = [
     "ES_CONTINUOUS", "ES_SYSTEM_REQUIRED", "ES_DISPLAY_REQUIRED",
     # structures
     "LASTINPUTINFO", "POWERSTATUS", "MEMORYSTATUSEX",
+    "WTSINFO", "WTS_SESSION_INFO",
     "JOBOBJECT_BASIC_LIMIT_INFORMATION", "IO_COUNTERS",
     "JOBOBJECT_EXTENDED_LIMIT_INFORMATION",
     "JOBOBJECT_CPU_RATE_CONTROL_INFORMATION",
@@ -44,6 +45,7 @@ __all__ = [
     "available", "get_last_error", "creation_flags",
     "get_tick_count", "get_last_input_info",
     "get_system_power_status", "global_memory_status_ex",
+    "session_idle_seconds",
     "set_thread_execution_state", "is_admin", "session_id",
     # job objects
     "create_job_object", "set_information_job_object", "open_process",
@@ -74,6 +76,12 @@ JOB_RATE_HARD_CAP = 0x4
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 ES_DISPLAY_REQUIRED = 0x00000002
+
+# WTS (terminal services) constants: WTS_CONNECTSTATE_CLASS.WTSActive and the
+# WTS_INFO_CLASS slot of WTSINFO, plus the "local server" pseudo-handle (NULL).
+WTS_ACTIVE = 1
+WTSINFO_CLASS = 24             # WTS_INFO_CLASS.WTSInfo
+WTS_CURRENT_SERVER_HANDLE = 0
 
 # ---------------------------------------------------------------------------
 # structures
@@ -169,6 +177,45 @@ class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
     ]
 
 
+class WTS_SESSION_INFO(ctypes.Structure):
+    """wtsapi32.WTSEnumerateSessionsW entry (WTS_SESSION_INFOW)."""
+
+    _fields_ = [
+        ("SessionId", ctypes.c_uint32),
+        ("pWinStationName", ctypes.c_wchar_p),
+        ("State", ctypes.c_uint32),     # WTS_CONNECTSTATE_CLASS
+    ]
+
+
+class WTSINFO(ctypes.Structure):
+    """wtsapi32.WTSQuerySessionInformationW(WTSInfo) payload.
+
+    Layout matches the SDK struct so ``sizeof`` included the natural 8-byte
+    padding before the ``LARGE_INTEGER`` timestamps. ``LastInputTime`` and
+    ``CurrentTime`` are FILETIME-like 100 ns ticks, which is what makes this
+    usable from session 0 where ``GetLastInputInfo`` only sees its own session.
+    """
+
+    _fields_ = [
+        ("State", ctypes.c_uint32),
+        ("SessionId", ctypes.c_uint32),
+        ("IncomingBytes", ctypes.c_uint32),
+        ("OutgoingBytes", ctypes.c_uint32),
+        ("IncomingFrames", ctypes.c_uint32),
+        ("OutgoingFrames", ctypes.c_uint32),
+        ("IncomingCompressedBytes", ctypes.c_uint32),
+        ("OutgoingCompressedBytes", ctypes.c_uint32),
+        ("WinStationName", ctypes.c_wchar * 32),
+        ("Domain", ctypes.c_wchar * 17),
+        ("UserName", ctypes.c_wchar * 21),
+        ("ConnectTime", ctypes.c_int64),
+        ("DisconnectTime", ctypes.c_int64),
+        ("LastInputTime", ctypes.c_int64),
+        ("LogonTime", ctypes.c_int64),
+        ("CurrentTime", ctypes.c_int64),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # lazy library loading (no side effects at import)
 # ---------------------------------------------------------------------------
@@ -177,6 +224,8 @@ _LOADED = False
 _K32 = None
 _U32 = None
 _SHELL32 = None
+_WTS_LOADED = False
+_WTS = None
 
 
 def _proto(fn, restype, argtypes):
@@ -232,6 +281,35 @@ def _libs():
     except Exception:
         _K32 = _U32 = _SHELL32 = None
     return _K32, _U32, _SHELL32
+
+
+def _wts():
+    """Load and prototype wtsapi32 once; ``None`` when unavailable.
+
+    Kept separate from :func:`_libs` so a host without ``wtsapi32.dll`` (or a
+    non-Windows dev box) still gets every kernel32/user32 probe.
+    """
+    global _WTS_LOADED, _WTS
+    if _WTS_LOADED:
+        return _WTS
+    _WTS_LOADED = True
+    windll = getattr(ctypes, "WinDLL", None)
+    if windll is None or sys.platform != "win32":
+        return None
+    try:
+        lib = windll("wtsapi32", use_last_error=False)
+        _proto(lib.WTSEnumerateSessionsW, ctypes.c_int,
+               [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.POINTER(ctypes.POINTER(WTS_SESSION_INFO)),
+                ctypes.POINTER(ctypes.c_uint32)])
+        _proto(lib.WTSQuerySessionInformationW, ctypes.c_int,
+               [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint32)])
+        _proto(lib.WTSFreeMemory, None, [ctypes.c_void_p])
+        _WTS = lib
+    except Exception:
+        _WTS = None
+    return _WTS
 
 
 def available():
@@ -365,6 +443,104 @@ def session_id(pid=None):
     except Exception:
         return None
     return int(value.value)
+
+
+def _wts_sessions(lib):
+    """``[(session_id, state), ...]`` from WTSEnumerateSessionsW (may be empty)."""
+    sessions = []
+    buffer = ctypes.POINTER(WTS_SESSION_INFO)()
+    count = ctypes.c_uint32(0)
+    try:
+        ok = lib.WTSEnumerateSessionsW(
+            ctypes.c_void_p(WTS_CURRENT_SERVER_HANDLE), 0, 1,
+            ctypes.byref(buffer), ctypes.byref(count))
+    except Exception:
+        return sessions
+    if not ok:
+        return sessions
+    try:
+        for index in range(int(count.value)):
+            try:
+                entry = buffer[index]
+                sessions.append((int(entry.SessionId), int(entry.State)))
+            except Exception:
+                continue
+    finally:
+        try:
+            lib.WTSFreeMemory(ctypes.cast(buffer, ctypes.c_void_p))
+        except Exception:
+            pass
+    return sessions
+
+
+def _wts_session_idle(lib, sid):
+    """Idle seconds reported by WTSINFO for one session, or ``None``."""
+    buffer = ctypes.c_void_p()
+    written = ctypes.c_uint32(0)
+    try:
+        ok = lib.WTSQuerySessionInformationW(
+            ctypes.c_void_p(WTS_CURRENT_SERVER_HANDLE), ctypes.c_uint32(sid),
+            WTSINFO_CLASS, ctypes.byref(buffer), ctypes.byref(written))
+    except Exception:
+        return None
+    if not ok or not buffer.value or int(written.value) < 8:
+        return None
+    try:
+        return _wtsinfo_idle(buffer)
+    finally:
+        try:
+            lib.WTSFreeMemory(buffer)
+        except Exception:
+            pass
+
+
+def _wtsinfo_idle(buffer):
+    """Idle seconds from a WTSINFO blob; ``None`` when the stamps are unusable.
+
+    WTSINFO timestamps are 100 ns units; a session that has never received
+    input (LastInputTime == 0) is reported as unknown, not as 50 years idle.
+    """
+    try:
+        info = ctypes.cast(buffer, ctypes.POINTER(WTSINFO)).contents
+        last_input = int(info.LastInputTime)
+        current = int(info.CurrentTime)
+    except Exception:
+        return None
+    if last_input <= 0 or current <= 0:
+        return None
+    idle = (current - last_input) / 10_000_000.0
+    return idle if idle >= 0 else 0.0
+
+
+def session_idle_seconds():
+    """Shortest idle time of any interactive session, or ``None``.
+
+    ``GetLastInputInfo`` only reports the *calling* session, so a controller in
+    session 0 is blind to the user at the keyboard. This walks the WTS session
+    table instead and returns the minimum idle across active, non-session-0,
+    non-current sessions - i.e. "is a person sitting at this PC right now".
+
+    ``None`` means unknown (non-Windows host, missing wtsapi32, a failed WTS
+    call, no interactive session, or no usable timestamps); callers keep their
+    previous behaviour in that case. Never raises.
+    """
+    lib = _wts()
+    if lib is None:
+        return None
+    try:
+        own_session = session_id()
+    except Exception:
+        own_session = None
+    best = None
+    for sid, state in _wts_sessions(lib):
+        if state != WTS_ACTIVE or sid == 0 or sid == own_session:
+            continue
+        value = _wts_session_idle(lib, sid)
+        if value is None:
+            continue
+        if best is None or value < best:
+            best = value
+    return best
 
 
 # ---------------------------------------------------------------------------

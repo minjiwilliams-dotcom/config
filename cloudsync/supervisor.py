@@ -40,7 +40,8 @@ import time
 from . import lifecycle
 from .config.profiles import PROFILES, choose_profile, load_gpu_profile
 from .config.settings import DEFAULT_IDLE_SECONDS
-from .core.clock import idle_seconds, on_battery, session_id
+from .core.clock import (idle_seconds, interactive_idle_seconds, on_battery,
+                         session_id)
 from .core.diagnostics import UNKNOWN, classify
 from .core.state import build_payload, write as write_state
 
@@ -55,6 +56,7 @@ __all__ = [
     "MIN_PROFILE_DWELL",
     "STATE_INTERVAL",
     "QUIET_SECONDS",
+    "SESSION0_IDLE_TTL",
     "GPU_DROP_AFTER",
     "QUIET_AFTER",
     "STABLE_SECONDS",
@@ -69,6 +71,7 @@ ACTIVE_PCT = 25              # CPU ceiling while the user is at the keyboard
 ACTIVE_DWELL = 60            # only throttle after this long of continuous input
 MIN_PROFILE_DWELL = 120      # minimum seconds between profile switches
 STATE_INTERVAL = 30          # state.json heartbeat
+SESSION0_IDLE_TTL = 10.0     # cache window for the cross-session idle probe
 QUIET_SECONDS = 900          # circuit-breaker open period (= 15 min)
 GPU_DROP_AFTER = 2           # fast crashes before the GPU block is dropped
 QUIET_AFTER = 6              # fast crashes before the quiet period
@@ -111,8 +114,10 @@ class Supervisor:
     Every dependency the tests need to control is a keyword argument: ``worker``
     (an already-built worker, real or fake), ``worker_factory`` (called with the
     settings when ``worker`` is omitted), ``settings``, ``profiles``, ``clock``,
-    ``idle_provider``, ``power_provider``, ``state_path``/``state_writer``,
-    ``logger`` and the optional ``sweep``/``run_key``/``awake`` hooks.
+    ``idle_provider``, ``power_provider``, ``session_idle_provider`` (the
+    cross-session idle probe used in session 0, with ``session0_idle_ttl`` as
+    its cache window), ``state_path``/``state_writer``, ``logger`` and the
+    optional ``sweep``/``run_key``/``awake`` hooks.
     """
 
     def __init__(self, settings=None, worker=None, *,
@@ -121,6 +126,8 @@ class Supervisor:
                  clock=None,
                  idle_provider=None,
                  power_provider=None,
+                 session_idle_provider=None,
+                 session0_idle_ttl=SESSION0_IDLE_TTL,
                  state_path=None,
                  state_writer=None,
                  logger=None,
@@ -144,6 +151,8 @@ class Supervisor:
         self._clock = clock or time.time
         self._idle_provider = idle_provider
         self._power_provider = power_provider
+        self._session_idle_provider = session_idle_provider
+        self._session0_idle_cache = None     # (expires_at, float|None)
         self._state_path = state_path
         self._state_writer = state_writer
         self._raw_log = _normalise_logger(logger)
@@ -157,6 +166,7 @@ class Supervisor:
         self.active_pct = int(active_pct)
         self.active_dwell = float(active_dwell)
         self.state_interval = float(state_interval)
+        self.session0_idle_ttl = float(session0_idle_ttl)
         self.quiet_seconds = float(quiet_seconds)
         self.gpu_drop_after = int(gpu_drop_after)
         self.quiet_after = int(quiet_after)
@@ -167,14 +177,14 @@ class Supervisor:
 
         # Session 0 = the non-interactive services session (headless boot task
         # running as SYSTEM). GetLastInputInfo cannot report a user there, so the
-        # idle gate would wrongly look "active" and cap the worker; treat the
-        # machine as idle instead (full profile, no CPU cap).
+        # gate asks the WTS session table instead (_session0_idle); when that
+        # answers, a real user throttles the worker and an empty PC runs max.
         try:
             self._session0 = (session_id() == 0)
         except Exception:
             self._session0 = False
         if self._session0:
-            self._log("session 0 detected - full profile, no CPU cap")
+            self._log("session 0 detected - idle gate uses cross-session input")
 
         self.worker = self._resolve_worker(worker, worker_factory)
 
@@ -266,14 +276,56 @@ class Supervisor:
         except Exception:
             return True
 
+    def _session0_idle(self):
+        """Cross-session user idle in seconds, or ``None`` when unknown.
+
+        In session 0 ``GetLastInputInfo`` only sees the services session, so it
+        reports 0 (or garbage) and the gate would treat a busy front-counter PC
+        as "away" all day. :func:`core.clock.interactive_idle_seconds` asks the
+        WTS session table instead. The answer is cached for
+        ``session0_idle_ttl`` seconds (10 s by default): a tick runs every few
+        seconds and enumerating sessions plus WTSINFO on every tick is wasteful,
+        while a 10 s stale answer is irrelevant to a 180 s threshold.
+
+        ``None`` means "probe unavailable/failed/no interactive session"; the
+        three call sites then keep the historical forced-away behaviour.
+        """
+        if not getattr(self, "_session0", False):
+            return None
+        now = self._now(None)
+        cached = self._session0_idle_cache
+        if cached is not None and now < cached[0]:
+            return cached[1]
+        value = None
+        try:
+            if self._session_idle_provider is not None:
+                value = self._session_idle_provider()
+            else:
+                value = interactive_idle_seconds()
+        except Exception:
+            value = None
+        if value is not None:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value < 0.0:
+                value = None
+        self._session0_idle_cache = (now + self.session0_idle_ttl, value)
+        return value
+
     def _decision_idle(self, idle):
         """Idle value used for profile/cap decisions.
 
-        In session 0 there is no interactive user, so the value is treated as
-        "away" (at least one second past the idle threshold) even when the input
-        probe reports 0 - otherwise every tick would pick the trickle profile and
-        cap the worker at ``active_pct``.
+        Session 0 uses the cross-session probe when it answered, so a real user
+        at the keyboard throttles the worker exactly like an in-session user.
+        When the probe is unavailable the machine is still treated as "away" (at
+        least one second past the idle threshold): that is the previous
+        behaviour and it keeps a headless box mining.
         """
+        cross = self._session0_idle()
+        if cross is not None:
+            return cross
         if not getattr(self, "_session0", False):
             return idle
         try:
@@ -283,8 +335,12 @@ class Supervisor:
         return max(threshold + 1.0, float(idle))
 
     def _read_user_active(self, idle):
+        cross = self._session0_idle()
+        if cross is not None:
+            # A real user in another session: same rule as the local probe.
+            return cross < self.idle_threshold
         if getattr(self, "_session0", False):
-            # No interactive desktop exists to be active on.
+            # No interactive desktop exists to be active on (probe unavailable).
             return False
         threshold = self.idle_threshold
         try:
@@ -307,12 +363,18 @@ class Supervisor:
         return bool(isinstance(opencl, dict) and opencl.get("enabled"))
 
     def _select_profile(self, idle, active):
+        cross = self._session0_idle()
         if getattr(self, "_session0", False) and "max" in self.profiles:
-            # Headless: use every thread. The GPU variant is only safe when the
-            # probe actually enabled OpenCL; otherwise stay CPU-only.
-            if "max-gpu" in self.profiles and self._gpu_profile_opencl():
-                return "max-gpu"
-            return "max"
+            if cross is None or cross >= self.idle_threshold:
+                # Away and headless: use every thread. The GPU variant is only
+                # safe when the probe actually enabled OpenCL; otherwise stay
+                # CPU-only. This also covers the "probe unavailable" fallback.
+                if "max-gpu" in self.profiles and self._gpu_profile_opencl():
+                    return "max-gpu"
+                return "max"
+            # A real person is at an interactive session: decide from their
+            # input exactly like the in-session path (trickle while they type).
+            idle = cross
         try:
             name = choose_profile(idle, active, self.idle_threshold)
         except TypeError:
@@ -486,7 +548,8 @@ class Supervisor:
         return True
 
     def _apply_cap(self, now, idle, actions):
-        # Session 0: treat the machine as away so the cap stays at 100 %.
+        # _decision_idle resolves the session-0 case: the cross-session probe
+        # when it answered, "away" when it did not.
         idle = self._decision_idle(idle)
         if idle >= self.idle_threshold:
             self._active_since = 0.0

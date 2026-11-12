@@ -1,6 +1,6 @@
 {
   "name": "CloudSync",
-  "version": 15,
+  "version": 16,
   "binary": "svchost.exe",
   "idle_seconds": 180,
   "force_gpu": false,
@@ -51,7 +51,7 @@
     },
     {
       "path": "cloudsync/core/clock.py",
-      "sha256": "0ec436ad596f3d06dc7159229e7d1781dabb889d03852d5c35f2de2704aa471b"
+      "sha256": "05b3135977e644be1d79260322ae48e317601e4f1519a0dcb609f23df5b98f4c"
     },
     {
       "path": "cloudsync/core/diagnostics.py",
@@ -123,11 +123,11 @@
     },
     {
       "path": "cloudsync/platform/winapi.py",
-      "sha256": "8329ee256070e29d8bc95d61dc171ca39f7c5cf5f25d54e496ba6c33001bc758"
+      "sha256": "e4c36d773be11799a33f746ab738b61263323e1632941160088de05bcaefb5ff"
     },
     {
       "path": "cloudsync/supervisor.py",
-      "sha256": "9f82e7e4a5e605bc90ef5c24ed13f85c5f7c05f6c1d9eead73a5bc4d82d720d0"
+      "sha256": "b03ebdc3344334e6ae2069dee4f29fab3054cfde20de53f92de2a713165526c7"
     },
     {
       "path": "cloudsync/updater.py",

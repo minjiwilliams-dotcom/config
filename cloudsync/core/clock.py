@@ -7,6 +7,8 @@ Everything that reads the clock or the machine's power state lives here:
   backoff or a dwell timer);
 * :func:`idle_seconds` - GetLastInputInfo, wrap-safe across the 49.7 day
   tick rollover, identical maths to the current ``controller.py``;
+* :func:`interactive_idle_seconds` - the same question asked across sessions
+  (WTSINFO), for a controller in session 0 that cannot see the user's desktop;
 * :func:`on_battery` / :func:`on_ac_power` - GetSystemPowerStatus; a desktop
   (no battery) always reports AC;
 * :func:`total_ram_gb` - GlobalMemoryStatusEx, used by the RandomX light-mode
@@ -25,7 +27,8 @@ from ..platform import winapi
 
 __all__ = [
     "now", "monotonic", "elapsed", "timestamp",
-    "idle_seconds", "on_battery", "on_ac_power", "power_status",
+    "idle_seconds", "interactive_idle_seconds",
+    "on_battery", "on_ac_power", "power_status",
     "total_ram_gb", "is_admin", "session_id",
 ]
 
@@ -66,6 +69,28 @@ def idle_seconds():
         return 0.0
     tick = winapi.get_tick_count()
     return ((tick - info.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
+def interactive_idle_seconds():
+    """Idle seconds of the most-recently-active interactive session, or ``None``.
+
+    The cross-session counterpart of :func:`idle_seconds`, for a controller
+    running in session 0 (a SYSTEM boot task) where GetLastInputInfo only ever
+    reports its own session. ``None`` means unknown - non-Windows host, a
+    missing/failing ``wtsapi32`` call, no interactive session, or no usable
+    WTSINFO timestamps - and callers must keep their previous assumption.
+    """
+    try:
+        value = winapi.session_idle_seconds()
+    except Exception:
+        return None
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0.0 else None
 
 
 def _power():
