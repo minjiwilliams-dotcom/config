@@ -98,6 +98,27 @@ def _default_fetch(url, timeout=30):
         return urllib.request.urlopen(url, timeout=timeout).read()
 
 
+def _safe_manifest_name(name):
+    """True when a manifest ``files[]`` path cannot escape the install dir.
+
+    A compromised (or accidental) manifest entry such as ``..\\evil.py``,
+    ``C:/x.py`` or ``a/../b.py`` is rejected. Forward-slash *relative*
+    subpaths ARE allowed, because the modular package ships as
+    ``cloudsync/<module>.py`` and the update channel has to be able to
+    deliver those modules; nothing with a drive letter, a backslash, an
+    absolute root or a ``..`` segment can ever be written.
+    """
+    text = str(name or "").strip()
+    if not text:
+        return False
+    if "\\" in text or ":" in text or text.startswith("/"):
+        return False
+    parts = text.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return False
+    return True
+
+
 def _normalise_logger(logger):
     if logger is None:
         return lambda _message: None
@@ -195,6 +216,9 @@ class Updater:
             for entry in (manifest.get("files") or []):
                 name = entry.get("path") or ""
                 sha = str(entry.get("sha256") or "").lower()
+                if name and not _safe_manifest_name(name):
+                    self._log("update: skipping unsafe manifest path %r" % (name,))
+                    continue
                 if name and sha and not sha.startswith("__"):
                     targets.append((name, sha))
             if targets:
@@ -275,6 +299,13 @@ class Updater:
         if UPDATE_TARGET in changed:
             atomic_write(self.path(UPDATE_MARK),
                          json.dumps({"applied": time.time(), "attempts": 0}))
+            return True
+        # A modular package module changed: the running supervisor has the old
+        # module objects in memory, so only a re-exec loads the new code. The
+        # flat controller marker/probation is deliberately NOT written here -
+        # handle_probation is inert on a modular install and a stale marker would
+        # be misleading.
+        if any(name.endswith(".py") and "/" in name for name in changed):
             return True
         if "config_high.json" in changed:
             return "restart-worker"

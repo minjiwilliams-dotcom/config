@@ -51,7 +51,10 @@ WORKER_LOG_NAME = "CloudSync.log"
 WORKER_LOG_MAX = 2 * 1024 * 1024
 
 FAST_FAIL_SECONDS = 30.0     # died sooner than this = a "fast" crash
-WARMUP_SECONDS = 30.0        # never kill a GPU worker while it is warming up
+#: Grace period before a stop kills the worker (was 30 s of real wall time, which
+#: made every supervisor restart take half a minute). 5 s is long enough for an
+#: OpenCL context to settle, and a stop now returns within ~10 s.
+WARMUP_SECONDS = 5.0
 BACKOFF_GPU_BASE = 60.0      # first GPU fast-crash backoff
 BACKOFF_CPU_BASE = 20.0
 BACKOFF_MAX = 900.0

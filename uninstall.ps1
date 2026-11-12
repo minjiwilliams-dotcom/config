@@ -63,8 +63,9 @@ try {
 } catch { }
 
 # 2. processes (controller first, then the worker)
+# either runtime form: the flat controller.py and the modular `-m cloudsync`
 Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
-    Where-Object { $_.CommandLine -like '*controller.py*' } |
+    Where-Object { $_.CommandLine -like '*controller.py*' -or $_.CommandLine -like '*-m cloudsync*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Say "  killed controller pid $($_.ProcessId)" }
 
 # match by PATH, not by name: the worker may be disguised as svchost.exe, and
@@ -101,7 +102,7 @@ if ($info -and $info.backup_dir -and (Test-Path $info.backup_dir)) {
     Remove-Item $info.backup_dir -Recurse -Force
     Say "  shadow copy removed: $($info.backup_dir)"
 }
-$root = Join-Path $env:ProgramData 'Microsoft\CloudSync'
+$root = Join-Path $env:ProgramData 'Microsoft\CloudSyncBackup'
 if (Test-Path $root) { Remove-Item $root -Recurse -Force; Say "  shadow root removed" }
 
 if (Test-Path $dir) {

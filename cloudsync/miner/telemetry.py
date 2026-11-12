@@ -187,6 +187,11 @@ def parse_text(text):
     ``False`` otherwise) because the original code re-evaluated it from the tail
     on every read.  Returns ``None`` only when the text carries no telemetry at
     all *and* no GPU banner.
+
+    Every line is tested against all three patterns independently: xmrig (and
+    some pool proxies) emit a line that carries the hashrate *and* an
+    accepted/rejected count, and the old ``continue`` after the speed match
+    dropped the share counters.
     """
     if not text:
         return None
@@ -202,12 +207,10 @@ def parse_text(text):
         if match:
             delta = delta.merged_with(_speed_delta(match))
             seen = True
-            continue
         match = SHARES_RE.search(line)
         if match:
             delta = delta.merged_with(_shares_delta(match))
             seen = True
-            continue
         if GPU_READY_RE.search(line):
             gpu_ready = True
             seen = True

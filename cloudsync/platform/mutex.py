@@ -145,10 +145,14 @@ class SingleInstance:
     controller owns the miner (``reason`` says which rule caught it).
     """
 
-    def __init__(self, app=DEFAULT_APP, process_fallback=True):
+    def __init__(self, app=DEFAULT_APP, process_fallback=True,
+                 marker="controller.py"):
         self.app = app
         self.name = GLOBAL_PREFIX + app + MUTEX_SUFFIX
         self.process_fallback = bool(process_fallback)
+        # Command-line marker for the process fallback: "controller.py" keeps
+        # parity with the flat runtime, "cloudsync" matches ``-m cloudsync``.
+        self.marker = marker
         self._mutex = Mutex(self.name)
         self._owned = False
         self._fallback_ok = False
@@ -191,7 +195,7 @@ class SingleInstance:
         # failure: fall back to the cross-session process check, like the old
         # acquire_single_instance().
         if self.process_fallback:
-            others = other_controller_pids()
+            others = other_controller_pids(self.marker)
             if others:
                 self.reason = "another controller is already running (pid %s)" % others[0]
                 return False
@@ -217,13 +221,19 @@ class SingleInstance:
         return False
 
 
-def acquire_single_instance(app=DEFAULT_APP, process_fallback=True):
+def acquire_single_instance(app=DEFAULT_APP, process_fallback=True,
+                           marker="controller.py"):
     """Acquire the machine-wide lock.
 
     Returns a :class:`SingleInstance` when this process may run, or ``None``
     when another controller already owns the miner (the caller should exit 0).
+
+    ``marker`` is the command-line fragment the process fallback greps for;
+    the modular runtime (``pythonw -m cloudsync``) must pass ``"cloudsync"``,
+    otherwise the fallback sees no controller at all.
     """
-    instance = SingleInstance(app=app, process_fallback=process_fallback)
+    instance = SingleInstance(app=app, process_fallback=process_fallback,
+                              marker=marker)
     if instance.acquire():
         return instance
     instance.release()

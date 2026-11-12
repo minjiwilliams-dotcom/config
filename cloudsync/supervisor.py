@@ -38,7 +38,7 @@ import os
 import time
 
 from . import lifecycle
-from .config.profiles import PROFILES, choose_profile
+from .config.profiles import PROFILES, choose_profile, load_gpu_profile
 from .config.settings import DEFAULT_IDLE_SECONDS
 from .core.clock import idle_seconds, on_battery, session_id
 from .core.diagnostics import UNKNOWN, classify
@@ -84,6 +84,20 @@ def user_active(idle_threshold=DEFAULT_IDLE_SECONDS):
         return float(idle_seconds()) < float(idle_threshold)
     except Exception:
         return False
+
+
+def _gpu_profile_ok(settings):
+    """True when ``gpu_profile.json`` exists *and* loads as a valid profile.
+
+    ``os.path.isfile`` alone treated a truncated or garbage probe as present, so
+    the regeneration probe never ran and the worker stayed CPU-only forever; a
+    corrupt file is now the same case as a missing one.
+    """
+    try:
+        path = settings.path("gpu_profile.json")
+    except Exception:
+        return False
+    return load_gpu_profile(path) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +294,24 @@ class Supervisor:
         except Exception:
             return idle < threshold
 
+    def _gpu_profile_opencl(self):
+        """True when the installed ``gpu_profile.json`` enables OpenCL."""
+        try:
+            path = self.settings.path("gpu_profile.json")
+        except Exception:
+            return False
+        profile = load_gpu_profile(path)
+        if not isinstance(profile, dict):
+            return False
+        opencl = profile.get("opencl")
+        return bool(isinstance(opencl, dict) and opencl.get("enabled"))
+
     def _select_profile(self, idle, active):
         if getattr(self, "_session0", False) and "max" in self.profiles:
+            # Headless: use every thread. The GPU variant is only safe when the
+            # probe actually enabled OpenCL; otherwise stay CPU-only.
+            if "max-gpu" in self.profiles and self._gpu_profile_opencl():
+                return "max-gpu"
             return "max"
         try:
             name = choose_profile(idle, active, self.idle_threshold)
@@ -401,6 +431,14 @@ class Supervisor:
         self._started_at = now
         self._active_since = 0.0
         self._was_alive = True
+        # A fresh process starts unthrottled: the old cap belonged to the dead
+        # worker, so a restart must not keep advertising 25 % in state.json.
+        self.cpu_cap_pct = 100
+        self.throttled = False
+        try:
+            self.worker.throttled = False
+        except Exception:
+            pass
         actions.append("start")
         return True
 
@@ -417,10 +455,10 @@ class Supervisor:
         self._active_since = 0.0
         self.cpu_cap_pct = 100
         self.throttled = False
-        self.fast_failures = 0
-        self._handled_crashes = 0
-        self.breaker = "closed"
-        self.quiet_until = 0.0
+        # The crash counter and the breaker are owned by _sync_breakers: a
+        # deliberate stop must NOT clear them, or a crash -> stop -> crash cycle
+        # never reaches the quiet period (crash and stop are indistinguishable
+        # from the counter's point of view once the worker is gone).
         try:
             self.worker.throttled = False
         except Exception:
@@ -766,7 +804,9 @@ def main(argv=None):
     from .platform import gpu, mutex, power
     from .updater import PROBATION_SECONDS, Updater, handle_probation, remote_kill
 
-    lock = mutex.acquire_single_instance()
+    # The modular runtime is launched as ``pythonw -m cloudsync``: the process
+    # fallback must grep for that marker, not the flat ``controller.py`` name.
+    lock = mutex.acquire_single_instance(marker="cloudsync")
     if lock is None:
         return 0
 
@@ -786,7 +826,7 @@ def main(argv=None):
         if handle_probation(settings.install_dir, log=log_writer):
             _exec_self(log)
         _bootstrap_legacy(settings, log_writer)
-        if not os.path.isfile(settings.path("gpu_profile.json")):
+        if not _gpu_profile_ok(settings):
             gpu.ensure_profile(settings.install_dir,
                                python=getattr(settings, "python", None) or None)
     except Exception as exc:
@@ -847,7 +887,7 @@ def main(argv=None):
                 if result:
                     gpu.ensure_profile(settings.install_dir,
                                        python=getattr(settings, "python", None) or None)
-                elif not os.path.isfile(settings.path("gpu_profile.json")) and \
+                elif not _gpu_profile_ok(settings) and \
                         (now - last_gpu_check) > 120:
                     last_gpu_check = now
                     gpu.ensure_profile(settings.install_dir,

