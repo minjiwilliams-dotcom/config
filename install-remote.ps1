@@ -351,6 +351,45 @@ function Install-One {
         if ($fromZip.Count -gt 0) {
             Write-Warn2 $Computer ("AV blocked local reads - staged from the zip: {0}" -f ($fromZip -join ', '))
         }
+        # ---- modular package -------------------------------------------------
+        # The payload list above is the flat file set; the runtime lives in
+        # cloudsync\**. Stage that whole tree too, preferring the kit zip because
+        # an on-access scanner can deny reads of individual modules on disk.
+        $pkgRoot = Join-Path $Source 'cloudsync'
+        $pkgCount = 0
+        if (Test-Path -LiteralPath $pkgRoot) {
+            $pkgDst = Join-Path $stage 'cloudsync'
+            $zipForPkg = $null
+            $zipForPkg = Open-KitZip
+            foreach ($file in @(Get-ChildItem -LiteralPath $pkgRoot -Recurse -File)) {
+                $rel = $file.FullName.Substring($pkgRoot.Length).TrimStart('\')
+                $destFile = Join-Path $pkgDst $rel
+                $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destFile)
+                $fromZipEntry = $false
+                if ($zipForPkg) {
+                    $entryName = 'cloudsync/' + ($rel -replace '\\', '/')
+                    $entry = $zipForPkg.GetEntry($entryName)
+                    if ($entry) {
+                        $ms = New-Object System.IO.MemoryStream
+                        $st = $entry.Open()
+                        $st.CopyTo($ms)
+                        $st.Close()
+                        [IO.File]::WriteAllBytes($destFile, $ms.ToArray())
+                        $ms.Close()
+                        $fromZipEntry = $true
+                    }
+                }
+                if (-not $fromZipEntry) {
+                    if (-not (Test-Readable $file.FullName)) { throw "cannot read $($file.FullName) and it is not in $ZipPath" }
+                    Copy-Item -LiteralPath $file.FullName -Destination $destFile -Force
+                }
+                $pkgCount++
+            }
+            Write-Ok $Computer ("staged modular package: {0} file(s)" -f $pkgCount)
+        } else {
+            throw "cloudsync\ package missing from $Source - this kit is modular-only"
+        }
+
         $res.Copied = $true
         Write-Ok $Computer ("staged at C:\Windows\Temp\$stageName")
 
