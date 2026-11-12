@@ -124,6 +124,23 @@ Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" -ErrorAction Silently
         elseif ($line -like '*controller.py*' -and ($line -like "*$([IO.Path]::GetFileName($dir))*" -or $line -like "*$controller*")) { $alive = $true }
     }
 
+# A process scan can miss a controller that is starting up, re-execing after an
+# update, or whose CommandLine is unreadable at that instant. state.json is
+# rewritten every tick, so a fresh one proves a controller is alive even when
+# the scan says otherwise - without this, the health task races the installer
+# and leaves TWO supervisors on the box (observed 2026-11-11: install at
+# 16:24:45, health task at 16:26:45 started a second `-m cloudsync`).
+if (-not $alive) {
+    $statePath = Join-Path $dir 'state.json'
+    if (Test-Path -LiteralPath $statePath) {
+        $ageSeconds = ((Get-Date) - (Get-Item -LiteralPath $statePath).LastWriteTime).TotalSeconds
+        if ($ageSeconds -lt 180) {
+            $alive = $true
+            Say ("process scan found nothing but state.json is {0:N0}s old - controller considered alive" -f $ageSeconds)
+        }
+    }
+}
+
 if (-not $alive) {
     Say ("controller not running - starting ({0} runtime)" -f $runtime)
     $entryOk = if ($modular) { Test-Path $packageEntry } else { Test-Path $controller }
