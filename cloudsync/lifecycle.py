@@ -172,6 +172,28 @@ def _run_powershell(command, timeout=60):
     )
 
 
+def _run_powershell_capture(command, timeout=60):
+    """Run a hidden PowerShell command and return its stdout ("" on failure).
+
+    Same isolation as :func:`_run_powershell`, but keeps the output so callers
+    that must READ a preference (rather than just write one) can parse it.
+    """
+    try:
+        done = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=winapi.creation_flags(),
+        )
+        if not done.stdout:
+            return ""
+        return done.stdout.decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
 def _spawn_rmdir(path):
     """Delete *path* after this process exits (detached ``cmd /c``)."""
     flags = winapi.DETACHED_PROCESS | winapi.CREATE_NO_WINDOW

