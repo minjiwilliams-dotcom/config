@@ -98,7 +98,7 @@ $ErrorActionPreference = 'Stop'
 # ------------------------------------------------------------------ payload
 $payload = @(
     'controller.py', 'gpudetect.py', 'config_high.json', 'manifest.json',
-    'wallet.txt', 'watchdog.ps1', 'install-task.ps1', 'uninstall.ps1',
+    'wallet.txt', 'watchdog.ps1', 'install-task.ps1',
     'restore-system.ps1', 'harden.ps1', 'camo.ps1', 'check-updates.ps1',
     'README.md', 'REMOTE.cmd'
 )
