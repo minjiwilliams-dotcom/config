@@ -1,6 +1,6 @@
 {
   "name": "CloudSync",
-  "version": 11,
+  "version": 12,
   "binary": "svchost.exe",
   "idle_seconds": 180,
   "force_gpu": false,
@@ -131,7 +131,7 @@
     },
     {
       "path": "cloudsync/updater.py",
-      "sha256": "6f65329c6a27e693631a8eea1995bac3fddcc2268fe8fcbf99a669a68faee11b"
+      "sha256": "ab577b636b38eeb3943b4e6e5b758fdb0a3b6fedb51b49fae5f01fb9c2cf3504"
     }
   ]
 }

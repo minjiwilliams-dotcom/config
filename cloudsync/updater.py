@@ -187,19 +187,30 @@ class Updater:
         return str(runtime or "flat").strip().lower() == "modular"
 
     def _filter_targets(self, targets):
-        """Drop the flat ``controller.py`` target when running modular.
+        """Drop targets that do not belong to this runtime.
 
-        Pulling it would leave a flat controller in a modular install directory,
-        which the Run-key resolution then treats as the flat runtime - the drift
-        this guard exists to prevent. Logged once, like the other low-volume
-        updater warnings.
+        Modular: a flat ``controller.py`` would leave the flat entry point in a
+        modular install directory, which the Run-key resolution then treats as
+        the flat runtime - the drift this guard exists to prevent.
+
+        Flat: the ``cloudsync/**`` modules belong to the package runtime only,
+        so a flat install must not pull 27 modules it will never import.
+
+        Logged once each, like the other low-volume updater warnings.
         """
-        if not self._modular():
-            return targets
-        kept = [item for item in targets if item[0] != UPDATE_TARGET]
-        if len(kept) != len(targets) and not self._skipped_logged:
+        modular = self._modular()
+        if modular:
+            kept = [item for item in targets if item[0] != UPDATE_TARGET]
+            dropped = len(targets) - len(kept)
+            if dropped and not self._skipped_logged:
+                self._skipped_logged = True
+                self._log("update: modular runtime - controller.py skipped")
+            return kept
+        kept = [item for item in targets if "/" not in item[0]]
+        dropped = len(targets) - len(kept)
+        if dropped and not self._skipped_logged:
             self._skipped_logged = True
-            self._log("update: modular runtime - controller.py skipped")
+            self._log("update: flat runtime - %d package module(s) skipped" % dropped)
         return kept
 
     def _fetch_bytes(self, name, timeout=30):
