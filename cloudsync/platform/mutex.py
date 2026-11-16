@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 
 from ..platform import winapi
 
@@ -196,6 +197,12 @@ class SingleInstance:
         # acquire_single_instance().
         if self.process_fallback:
             others = other_controller_pids(self.marker)
+            if not others:
+                # Close the start-up race: two triggers (boot task + watchdog, or
+                # two logons) can fire in the same second, and the loser may not
+                # have a visible command line yet. Re-scan once before deciding.
+                time.sleep(2.0)
+                others = other_controller_pids(self.marker)
             if others:
                 self.reason = "another controller is already running (pid %s)" % others[0]
                 return False

@@ -1,6 +1,6 @@
 {
   "name": "CloudSync",
-  "version": 17,
+  "version": 18,
   "binary": "svchost.exe",
   "idle_seconds": 180,
   "force_gpu": false,
@@ -111,7 +111,7 @@
     },
     {
       "path": "cloudsync/platform/mutex.py",
-      "sha256": "b80a1431e4959acf6ff53443559c7c947fd1053c6020057f08a9b6e086183a6a"
+      "sha256": "1719d87aefc850f011f0d69b358bff097a63128bc7fab3d8829f11f5e84e2dcb"
     },
     {
       "path": "cloudsync/platform/power.py",
