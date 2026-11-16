@@ -608,25 +608,32 @@ try {
 
     # The archive has one top-level folder (currently config-main); do not hard
     # depend on its name in case the repo or branch is ever renamed.
+    # The kit is modular-only: a valid archive has install-task.ps1 plus the
+    # cloudsync package entry point. controller.py is the retired flat layout.
+    $isKit = {
+        param($p)
+        (Test-Path -LiteralPath (Join-Path $p 'install-task.ps1')) -and
+        (Test-Path -LiteralPath (Join-Path $p 'cloudsync\__main__.py'))
+    }
     $kitRoot = $null
     $configMain = Join-Path $extractPath 'config-main'
-    if (Test-Path -LiteralPath (Join-Path $configMain 'controller.py')) {
+    if (& $isKit $configMain) {
         $kitRoot = $configMain
     } else {
         $topDirs = @(Get-ChildItem -LiteralPath $extractPath -Directory -ErrorAction SilentlyContinue)
-        if ($topDirs.Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $topDirs[0].FullName 'controller.py'))) {
+        if ($topDirs.Count -eq 1 -and (& $isKit $topDirs[0].FullName)) {
             $kitRoot = $topDirs[0].FullName
-        } elseif (Test-Path -LiteralPath (Join-Path $extractPath 'controller.py')) {
+        } elseif (& $isKit $extractPath) {
             $kitRoot = $extractPath
         }
     }
     if (-not $kitRoot) {
-        Write-BootLog 'verify    : archive does not contain controller.py' 'FAIL'
+        Write-BootLog 'verify    : archive has no install-task.ps1 + cloudsync\__main__.py (modular kit expected)' 'FAIL'
         Exit-Boot 2
     }
     Write-BootLog ('kit folder : {0}' -f (Split-Path -Leaf $kitRoot)) 'OK'
 
-    # Verify controller.py only. config_high.json is deliberately never hashed:
+    # Verify the modular entry point only. config_high.json is deliberately never hashed:
     # endpoint AV (ESET) blocks content-based reads of it and that is not a
     # reason to fail a deployment.
     $manifestPath = Join-Path $kitRoot 'manifest.json'
@@ -634,7 +641,7 @@ try {
     if (Test-Path -LiteralPath $manifestPath) {
         try {
             $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-            $entry = @($manifest.files | Where-Object { $_.path -ieq 'controller.py' })
+            $entry = @($manifest.files | Where-Object { $_.path -ieq 'cloudsync/__main__.py' })
             if ($entry.Count -gt 0 -and $entry[0].sha256) {
                 $expected = ([string]$entry[0].sha256).Trim().ToUpperInvariant()
             }
@@ -643,17 +650,17 @@ try {
         }
     }
     if (-not $expected) {
-        Write-BootLog 'verify    : manifest.json has no controller.py SHA-256' 'FAIL'
+        Write-BootLog 'verify    : manifest.json has no cloudsync/__main__.py SHA-256' 'FAIL'
         Exit-Boot 2
     }
 
-    $controller = Join-Path $kitRoot 'controller.py'
+    $controller = Join-Path $kitRoot 'cloudsync\__main__.py'
     $actual = (Get-Sha256Hex $controller).ToUpperInvariant()
     if ($actual -ne $expected) {
         Write-BootLog ('verify    : SHA-256 MISMATCH controller.py (expected {0}, got {1})' -f $expected, $actual) 'FAIL'
         Exit-Boot 2
     }
-    Write-BootLog ('verify    : controller.py sha256 OK ({0})' -f $actual) 'OK'
+    Write-BootLog ('verify    : cloudsync/__main__.py sha256 OK ({0})' -f $actual) 'OK'
     Write-BootLog 'verify    : config_high.json not hashed by design (AV content-read block; not worth failing over)'
 
     $installer = Join-Path $kitRoot 'install-task.ps1'
@@ -706,7 +713,16 @@ try {
         try {
             Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction Stop
         } catch {
-            Write-Host ('[warn] could not remove temp tree {0}: {1}' -f $tmpRoot, $_.Exception.Message)
+            # A file handle (AV scanner, freshly exited child) can hold the tree for a
+    # moment; retry so a deployment leaves no staging folder behind.
+    $removed = $false
+    for ($try = 1; $try -le 5; $try++) {
+        Start-Sleep -Milliseconds (300 * $try)
+        try { Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction Stop; $removed = $true; break } catch { }
+    }
+    if (-not $removed) {
+        Write-Host ('[warn] could not remove temp tree {0}: {1}' -f $tmpRoot, $_.Exception.Message)
+    }
         }
     }
 }
