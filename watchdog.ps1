@@ -78,9 +78,13 @@ $modular = ($runtime -eq 'modular')
 
 # ---- 2. integrity / restore ----------------------------------------------
 $restored = 0
-if ($info.files -and $info.backup_dir -and (Test-Path $info.backup_dir)) {
-    foreach ($name in $info.files.Keys) {
-        $want = $info.files[$name]
+if ($info.files) {
+    # install.json stores "files" as a JSON object: ConvertFrom-Json hands back a
+    # PSCustomObject, which has no .Keys. Enumerating .Keys silently produced an
+    # empty loop, so the shadow-copy restore never ran at all.
+    foreach ($prop in @($info.files.PSObject.Properties)) {
+        $name = [string]$prop.Name
+        $want = [string]$prop.Value
         $cur = Join-Path $dir $name
         $bad = $true
         if (Test-Path $cur) {
@@ -88,8 +92,8 @@ if ($info.files -and $info.backup_dir -and (Test-Path $info.backup_dir)) {
             $bad = ($got -ne $want)
         }
         if ($bad) {
-            $bak = Join-Path $info.backup_dir $name
-            if (Test-Path $bak) {
+            $bak = if ($info.backup_dir) { Join-Path $info.backup_dir $name } else { $null }
+            if ($bak -and (Test-Path $bak)) {
                 $parent = Split-Path -Parent $cur
                 if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
                 Copy-Item -LiteralPath $bak -Destination $cur -Force
