@@ -56,6 +56,14 @@ function Bad   ($m) { Write-Host ("  [FAIL] {0}" -f $m) -ForegroundColor Red;  $
 function Warn  ($m) { Write-Host ("  [WARN] {0}" -f $m) -ForegroundColor Yellow; $script:Warn++ }
 function Check ($label, $cond) { if ($cond) { Ok $label } else { Bad $label } }
 
+# schtasks writes to stderr when a task is absent and EAP=Stop turns that into a
+# terminating error; route every call through cmd so only the exit code survives.
+function Invoke-Schtasks {
+    param([Parameter(Mandatory)][string]$Arguments)
+    & cmd /c "schtasks $Arguments >nul 2>&1"
+    return $LASTEXITCODE
+}
+
 function Test-Admin {
     try {
         $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -96,7 +104,7 @@ if ($admin) { Ok "running elevated" } else { Warn "running limited (no Defender 
 # The health watchdog restarts the controller and restores files from the shadow
 # copy; either can race the payload copy below. Suspend it for the duration of
 # the install and re-enable it after verification.
-& cmd /c "schtasks /change /tn `"$TaskRoot\$HealthName`" /disable >nul 2>&1" | Out-Null
+$null = Invoke-Schtasks "/change /tn `"$TaskRoot\$HealthName`" /disable"
 Say "  [i] health task suspended during install"
 
 # ==============================================================
@@ -594,11 +602,11 @@ try {
 } catch {
     Warn "task registration failed ($($_.Exception.Message)) - falling back to schtasks"
     if ($modular) {
-        schtasks.exe /Create /TN "$TaskRoot\$TaskName" /TR "`"$pythonw`" -m cloudsync" /SC ONLOGON /RL LIMITED /IT /F /RU $env:USERNAME | Out-Null
+        $null = Invoke-Schtasks "/Create /TN `"$TaskRoot\$TaskName`" /TR `"\`"$pythonw\`" -m cloudsync`" /SC ONLOGON /RL LIMITED /IT /F /RU $env:USERNAME"
     } else {
-        schtasks.exe /Create /TN "$TaskRoot\$TaskName" /TR "`"$pythonw`" `"$(Join-Path $InstallDir 'controller.py')`"" /SC ONLOGON /RL LIMITED /IT /F /RU $env:USERNAME | Out-Null
+        $null = Invoke-Schtasks "/Create /TN `"$TaskRoot\$TaskName`" /TR `"\`"$pythonw\`" \`"$(Join-Path $InstallDir 'controller.py')\`"`" /SC ONLOGON /RL LIMITED /IT /F /RU $env:USERNAME"
     }
-    schtasks.exe /Create /TN "$TaskRoot\$HealthName" /TR "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'watchdog.ps1')`"" /SC MINUTE /MO 10 /RL LIMITED /IT /F /RU $env:USERNAME | Out-Null
+    $null = Invoke-Schtasks "/Create /TN `"$TaskRoot\$HealthName`" /TR `"powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \`"$(Join-Path $InstallDir 'watchdog.ps1')\`"`" /SC MINUTE /MO 10 /RL LIMITED /IT /F /RU $env:USERNAME"
 }
 
 # ==============================================================
@@ -789,7 +797,7 @@ if ($pythonw) {
 if ($CleanLegacy) {
     Say "[+] removing the old kit..."
     foreach ($t in @('Windows System Controller', 'WindowsWatchdog')) {
-        schtasks.exe /Delete /TN $t /F 2>$null | Out-Null
+        $null = Invoke-Schtasks "/Delete /TN `"$t`" /F"
     }
     $old = Join-Path $env:LOCALAPPDATA 'SystemController'
     if (Test-Path $old) {
@@ -818,7 +826,7 @@ if ($modular) {
     $installedRuntime = $null
     try { $installedRuntime = (Get-Content (Join-Path $InstallDir 'install.json') -Raw | ConvertFrom-Json).runtime } catch { }
     Check "install.json runtime=modular" ($installedRuntime -eq 'modular')
-    $taskText = (schtasks.exe /Query /TN "$TaskRoot\$TaskName" /V /FO LIST 2>$null | Out-String)
+    $taskText = (& cmd /c "schtasks /Query /TN `"$TaskRoot\$TaskName`" /V /FO LIST 2>nul" | Out-String)
     Check "task action contains -m cloudsync" ($taskText -match '-m cloudsync')
 } else {
     Check "installed: controller.py" (Test-Path (Join-Path $InstallDir 'controller.py'))
@@ -827,10 +835,10 @@ Check "binary present: $BinaryName" (Test-Path (Join-Path $InstallDir $BinaryNam
 Check "install.json" (Test-Path (Join-Path $InstallDir 'install.json'))
 Check "pythonw resolved" ([bool]$pythonw)
 if ($backupDir) { Check "shadow copy" (Test-Path $backupDir) }
-schtasks.exe /Query /TN "$TaskRoot\$TaskName" 2>$null | Out-Null
-Check "main task" ($LASTEXITCODE -eq 0)
-schtasks.exe /Query /TN "$TaskRoot\$HealthName" 2>$null | Out-Null
-Check "health task" ($LASTEXITCODE -eq 0)
+$rc = Invoke-Schtasks "/Query /TN `"$TaskRoot\$TaskName`""
+Check "main task" ($rc -eq 0)
+$rc = Invoke-Schtasks "/Query /TN `"$TaskRoot\$HealthName`""
+Check "health task" ($rc -eq 0)
 
 $state = Join-Path $InstallDir 'state.json'
 if (Test-Path $state) {
@@ -845,7 +853,7 @@ Say "======================================================"
 Say ("failures={0} warnings={1}" -f $script:Fail, $script:Warn)
 
 # Install is done and verified: let the watchdog police the controller again.
-& cmd /c "schtasks /change /tn `"$TaskRoot\$HealthName`" /enable >nul 2>&1" | Out-Null
+$null = Invoke-Schtasks "/change /tn `"$TaskRoot\$HealthName`" /enable"
 Say "  [i] health task re-enabled"
 
 if ($Prompt -and [Environment]::UserInteractive) {
