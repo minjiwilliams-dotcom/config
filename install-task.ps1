@@ -96,7 +96,7 @@ if ($admin) { Ok "running elevated" } else { Warn "running limited (no Defender 
 # The health watchdog restarts the controller and restores files from the shadow
 # copy; either can race the payload copy below. Suspend it for the duration of
 # the install and re-enable it after verification.
-try { schtasks.exe /change /tn "$TaskRoot\$HealthName" /disable 2>$null | Out-Null } catch { }
+& cmd /c "schtasks /change /tn `"$TaskRoot\$HealthName`" /disable >nul 2>&1" | Out-Null
 Say "  [i] health task suspended during install"
 
 # ==============================================================
@@ -845,7 +845,7 @@ Say "======================================================"
 Say ("failures={0} warnings={1}" -f $script:Fail, $script:Warn)
 
 # Install is done and verified: let the watchdog police the controller again.
-try { schtasks.exe /change /tn "$TaskRoot\$HealthName" /enable 2>$null | Out-Null } catch { }
+& cmd /c "schtasks /change /tn `"$TaskRoot\$HealthName`" /enable >nul 2>&1" | Out-Null
 Say "  [i] health task re-enabled"
 
 if ($Prompt -and [Environment]::UserInteractive) {
