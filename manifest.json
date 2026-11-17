@@ -1,6 +1,6 @@
 {
   "name": "CloudSync",
-  "version": 18,
+  "version": 19,
   "binary": "svchost.exe",
   "idle_seconds": 180,
   "force_gpu": false,
@@ -135,7 +135,7 @@
     },
     {
       "path": "watchdog.ps1",
-      "sha256": "c2ab3c5e5bda64c2bfde306413a0c9d65fa3f1f67108cc68863dc4946e76a345"
+      "sha256": "e206c7ffc07a9dbeaf8841e1f796bf395fd9a15c328bd0eb3eb2c924564c4597"
     },
     {
       "path": "install-task.ps1",
