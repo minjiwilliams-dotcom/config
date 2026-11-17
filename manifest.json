@@ -1,6 +1,6 @@
 {
   "name": "CloudSync",
-  "version": 19,
+  "version": 20,
   "binary": "svchost.exe",
   "idle_seconds": 180,
   "force_gpu": false,
