@@ -1,6 +1,6 @@
 {
   "name": "CloudSync",
-  "version": 27,
+  "version": 28,
   "binary": "svchost.exe",
   "idle_seconds": 180,
   "force_gpu": false,
@@ -143,7 +143,7 @@
     },
     {
       "path": "controller.py",
-      "sha256": "89c24055751b563ae4e470ace3963b9a58cf6f81046c7bbf829336aba7533f00"
+      "sha256": "2c86eddb4d273f2d2c16ff80e58e4d5775a3aae8de1e1dfd01ad5429982f895e"
     }
   ]
 }

@@ -381,11 +381,122 @@ def ensure_run_key():
         return False
 
 
+# ============================================================
+# single instance: one miner per MACHINE, however many users are signed in
+# ============================================================
+
+ERROR_ALREADY_EXISTS = 183      # the mutex already existed: someone else owns it
+ERROR_ACCESS_DENIED = 5         # the mutex exists but its DACL hides it from us
+ERROR_SHARING_VIOLATION = 32    # the lock file already has an exclusive holder
+GENERIC_READ, GENERIC_WRITE = 0x80000000, 0x40000000
+OPEN_ALWAYS = 4
+FILE_ATTRIBUTE_HIDDEN = 0x2
+INVALID_HANDLE_VALUE = 0xFFFFFFFFFFFFFFFF
+MUTEX_ALL_ACCESS = 0x001F0001
+
+# A named object created with a NULL LPSECURITY_ATTRIBUTES inherits the
+# creator's default DACL. Under SYSTEM that is SYSTEM + Administrators only, and
+# a UAC-filtered token carries Administrators deny-only, so the second
+# controller gets ERROR_ACCESS_DENIED instead of ERROR_ALREADY_EXISTS. An
+# explicit DACL lets every account open the one machine-wide object; the mutex is
+# only a presence flag (nobody waits on it), so granting Everyone full access
+# changes no behaviour beyond that.
+MUTEX_SDDL = "D:(A;;0x001F0001;;;SY)(A;;0x001F0001;;;BA)(A;;0x001F0001;;;WD)"
+
+# A restart is the common case: the updater replaces the files and re-execs the
+# controller, and the child can reach CreateMutexW before the parent's handle is
+# closed (and, on a fallback install, before the file handle is). "Taken" is
+# therefore retried for ~20 s before it is believed - still fail-closed, just not
+# on a single racy sample.
+RETRY_ATTEMPTS = 40
+RETRY_DELAY = 0.5                # 40 x 0.5 s = ~20 s
+
+LOCK_FILENAME = ".single-instance.lock"
+
 _MUTEX = [None]
+_LOCK = [None]
+_MUTEX_SA = []
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [("nLength", wt.DWORD),
+                ("lpSecurityDescriptor", ctypes.c_void_p),
+                ("bInheritHandle", wt.BOOL)]
+
+
+def mutex_security():
+    """SECURITY_ATTRIBUTES admitting every account, or None when unavailable."""
+    if not _MUTEX_SA:
+        sa = None
+        try:
+            adv = ctypes.windll.advapi32
+            convert = adv.ConvertStringSecurityDescriptorToSecurityDescriptorW
+            convert.restype = wt.BOOL
+            convert.argtypes = [ctypes.c_wchar_p, wt.DWORD,
+                                ctypes.POINTER(ctypes.c_void_p),
+                                ctypes.POINTER(wt.DWORD)]
+            sd = ctypes.c_void_p()
+            if convert(MUTEX_SDDL, 1, ctypes.byref(sd), None):
+                sa = _SecurityAttributes(
+                    ctypes.sizeof(_SecurityAttributes), sd, 0)
+        except Exception:
+            sa = None
+        _MUTEX_SA.append(sa)
+    return _MUTEX_SA[0]
+
+
+def _create_mutex(name, initial_owner=False):
+    """CreateMutexW with the permissive DACL; returns (handle, last_error).
+
+    Prototyped on purpose: the SECURITY_ATTRIBUTES address is passed as an int,
+    which ctypes would otherwise truncate to a C int.
+    """
+    k32 = ctypes.windll.kernel32
+    create = k32.CreateMutexW
+    create.restype = ctypes.c_void_p
+    create.argtypes = [ctypes.c_void_p, wt.BOOL, ctypes.c_wchar_p]
+    sa = mutex_security()
+    handle = create(ctypes.addressof(sa) if sa else None,
+                    1 if initial_owner else 0, name)
+    return handle, k32.GetLastError()
+
+
+def machine_lock_path():
+    """Machine-wide lock file - same for every user, session and install mode."""
+    return os.path.join(os.environ.get("ProgramData") or r"C:\ProgramData",
+                        "Microsoft", APP, LOCK_FILENAME)
+
+
+def open_exclusive(path):
+    """Create/open *path* with no sharing; returns (handle, last_error).
+
+    A second process gets ERROR_SHARING_VIOLATION (32); a token without rights
+    gets ERROR_ACCESS_DENIED (5). The kernel drops the handle when the process
+    dies, so a stale lock can never outlive a controller.
+    """
+    try:
+        k32 = ctypes.windll.kernel32
+        create = k32.CreateFileW
+        create.restype = ctypes.c_void_p
+        create.argtypes = [ctypes.c_wchar_p, wt.DWORD, wt.DWORD,
+                           ctypes.c_void_p, wt.DWORD, wt.DWORD,
+                           ctypes.c_void_p]
+        handle = create(path, GENERIC_READ | GENERIC_WRITE, 0, None,
+                        OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, None)
+        err = k32.GetLastError()
+    except Exception:
+        return 0, 0
+    if not handle or int(handle) == INVALID_HANDLE_VALUE:
+        return 0, err
+    return int(handle), 0
 
 
 def _controller_pids():
-    """Every controller process on the box, in any user session."""
+    """Every controller process on the box, in any user session.
+
+    Diagnostic only: Win32_Process.CommandLine is NULL for any process this
+    token cannot open, so a scan can never be the decision.
+    """
     ps = ("Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe' OR Name='python.exe'\" | "
           "Where-Object { $_.CommandLine -like '*controller.py*' } | ForEach-Object { $_.ProcessId }")
     try:
@@ -402,31 +513,72 @@ def acquire_single_instance():
     """One miner per MACHINE, however many users are signed in.
 
     'Local\\' mutexes are per-session, so two logged-in users would each start
-    a controller and mine twice. A Global\\ mutex fixes that; if the account
-    lacks the privilege for the global namespace, fall back to a cross-session
-    process check (which also covers the multi-session case).
+    a controller and mine twice. A Global\\ mutex fixes that, created with an
+    explicit permissive DACL: a SYSTEM-created mutex then answers a Limited
+    token with ERROR_ALREADY_EXISTS (183) instead of ERROR_ACCESS_DENIED (5) -
+    both mean another instance owns the miner, so both exit here. When the
+    mutex is unavailable altogether, an exclusive handle on a ProgramData lock
+    file is the DACL- and session-independent guard. The old process scan is
+    gone from the decision: CommandLine is NULL for processes this token cannot
+    open.
     """
+    err = 0
     try:
         k32 = ctypes.windll.kernel32
-        handle = k32.CreateMutexW(None, False, "Global\\%s.Ctrl" % APP)
-        err = k32.GetLastError()
-        if handle and err != 183:          # 183 = ERROR_ALREADY_EXISTS
-            _MUTEX[0] = handle
-            return handle
-        if handle:
-            k32.CloseHandle(handle)
-        if err == 183:
-            log("another session already owns the miner (global mutex) - exiting")
-            return None
-        # err == 5 (access denied): no global-namespace privilege, check below
+        for attempt in range(RETRY_ATTEMPTS):
+            handle, err = _create_mutex("Global\\%s.Ctrl" % APP)
+            if handle and err != ERROR_ALREADY_EXISTS:
+                _MUTEX[0] = handle
+                return handle
+            if handle:                     # someone else owns it: drop our ref
+                k32.CloseHandle(ctypes.c_void_p(handle))
+            if err not in (ERROR_ALREADY_EXISTS, ERROR_ACCESS_DENIED):
+                break
+            if attempt + 1 < RETRY_ATTEMPTS:
+                time.sleep(RETRY_DELAY)
+    except Exception:
+        err = 0
+
+    if err == ERROR_ALREADY_EXISTS:
+        log("another session already owns the miner (global mutex) - exiting")
+        return None
+    if err == ERROR_ACCESS_DENIED:
+        # The object EXISTS and its DACL does not admit this token (SYSTEM's
+        # task created it): a second instance, not "no mutex".
+        log("another session owns the miner (global mutex ACL) - exiting")
+        return None
+
+    # No global namespace at all: one DACL- and session-independent guard. An
+    # exclusive handle in the machine-wide install dir is atomic and dies with
+    # the process, so a stale lock can never outlive a controller.
+    path = machine_lock_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError:
+        pass
+    handle, file_err = open_exclusive(path)
+    if handle:
+        _LOCK[0] = handle
+        return handle
+    if file_err == ERROR_SHARING_VIOLATION:
+        log("another controller holds the machine-wide lock file - exiting")
+        return None
+    # No rights on the lock file either: fail open, as before.
+    log("single instance: global mutex and lock file unavailable "
+        "(mutex %d, file %d) - continuing" % (err, file_err))
+    return True
+
+
+def release_single_instance():
+    """Drop both guards; a running controller normally holds them until exit."""
+    try:
+        k32 = ctypes.windll.kernel32
+        for slot in (_MUTEX, _LOCK):
+            if slot[0]:
+                k32.CloseHandle(ctypes.c_void_p(slot[0]))
+                slot[0] = None
     except Exception:
         pass
-
-    others = [p for p in _controller_pids() if p != os.getpid()]
-    if others:
-        log("another controller is already running (pid %s) - exiting" % others[0])
-        return None
-    return True
 
 
 def tail_text(path, nbytes=16384):
@@ -1170,7 +1322,9 @@ def main():
                     # native-style throttle: never restart, just re-cap
                     if idle >= settings.idle:
                         active_since = 0.0
-                        cap = 100
+                        # away ceiling is 75%, not 100%: leave headroom on unstable
+                        # hardware (WHEA 0x124 hangs when the miner saturates every thread)
+                        cap = 75
                     else:
                         if not active_since:
                             active_since = now
