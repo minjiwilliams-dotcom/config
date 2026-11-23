@@ -28,6 +28,7 @@ from ..platform import winapi
 __all__ = [
     "DEFAULT_APP", "GLOBAL_PREFIX", "LOCAL_PREFIX", "MUTEX_SUFFIX",
     "ERROR_ALREADY_EXISTS", "ERROR_ACCESS_DENIED",
+    "RETRY_ATTEMPTS", "RETRY_DELAY",
     "Mutex", "SingleInstance", "acquire_single_instance",
     "other_controller_pids", "machine_lock_path",
 ]
@@ -39,6 +40,14 @@ MUTEX_SUFFIX = ".Ctrl"
 
 ERROR_ALREADY_EXISTS = winapi.ERROR_ALREADY_EXISTS      # 183
 ERROR_ACCESS_DENIED = winapi.ERROR_ACCESS_DENIED        # 5
+
+# A restart is the common case: the outgoing controller releases the mutex and
+# execs its replacement, and the child can reach CreateMutexW before the parent's
+# handle is actually closed (and, on a fallback install, before the file handle
+# is).  "Taken" is therefore retried for ~20 s before it is believed - still
+# fail-closed, just not on a single racy sample.
+RETRY_ATTEMPTS = 40
+RETRY_DELAY = 0.5            # 40 x 0.5 s = ~20 s
 
 # Same probe controller.py used: every controller process on the box, in any
 # session.  The marker is the script name because that is what the scheduled
@@ -110,21 +119,44 @@ class Mutex:
     def __bool__(self):
         return bool(self.owned)
 
-    def acquire(self):
-        """Create/open the mutex; True when this process now owns it."""
+    def acquire(self, attempts=RETRY_ATTEMPTS, delay=RETRY_DELAY):
+        """Create/open the mutex; True when this process now owns it.
+
+        ``ERROR_ALREADY_EXISTS`` and ``ERROR_ACCESS_DENIED`` are retried for
+        ``attempts x delay`` seconds (~20 s by default) before they are believed:
+        the previous controller releases the handle and execs its replacement,
+        and the child routinely reaches CreateMutexW inside that window.  Still
+        fail-closed - once the window is exhausted another instance owns the
+        miner.
+        """
         if self.owned:
             return True
-        handle, error = winapi.create_mutex(self.name, initial_owner=False)
+        try:
+            attempts = max(1, int(attempts))
+        except (TypeError, ValueError):
+            attempts = RETRY_ATTEMPTS
+        try:
+            delay = max(0.0, float(delay))
+        except (TypeError, ValueError):
+            delay = RETRY_DELAY
+        error = 0
+        for attempt in range(attempts):
+            handle, error = winapi.create_mutex(self.name, initial_owner=False)
+            self.error = error
+            if handle and error != ERROR_ALREADY_EXISTS:
+                self.handle = handle
+                self.owned = True
+                return True
+            if handle:
+                # Someone else owns it: release our reference to the kernel object.
+                winapi.close_handle(handle)
+            self.handle = 0
+            self.owned = False
+            if error not in (ERROR_ALREADY_EXISTS, ERROR_ACCESS_DENIED):
+                break
+            if attempt + 1 < attempts and delay:
+                time.sleep(delay)
         self.error = error
-        if handle and error != ERROR_ALREADY_EXISTS:
-            self.handle = handle
-            self.owned = True
-            return True
-        if handle:
-            # Someone else owns it: release our reference to the kernel object.
-            winapi.close_handle(handle)
-        self.handle = 0
-        self.owned = False
         return False
 
     def close(self):
@@ -200,6 +232,9 @@ class SingleInstance:
             self._owned = True
             return True
 
+        # Both "taken" answers below come back only after
+        # Mutex.acquire()'s bounded retry window, so a restarting parent's
+        # still-open handle is not mistaken for a second instance.
         if self._mutex.error == ERROR_ALREADY_EXISTS:
             self.reason = "another session already owns the miner (global mutex)"
             return False

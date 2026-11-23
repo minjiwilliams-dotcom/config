@@ -43,9 +43,11 @@ __all__ = [
     "UPDATE_MARK",
     "UPDATE_TARGET",
     "KILL_FILE",
+    "INSTALL_INFO",
     "DEFAULT_UPDATE_FILES",
     "Updater",
     "handle_probation",
+    "refresh_install_pins",
     "remote_kill",
 ]
 
@@ -56,6 +58,7 @@ PROBATION_ATTEMPTS = 3       # starts before the .prev rollback
 UPDATE_MARK = "update.json"
 UPDATE_TARGET = "controller.py"
 KILL_FILE = "delete.txt"
+INSTALL_INFO = "install.json"     # the watchdog's local source of truth
 
 _MIN_BODY = 40               # ignore truncated/error bodies (parity)
 
@@ -129,6 +132,91 @@ def _normalise_logger(logger):
         if callable(method):
             return method
     return lambda _message: None
+
+
+def _pin_key(name):
+    """Normalised ``install.json`` pin key (Windows path form, case-insensitive)."""
+    return str(name or "").strip().replace("/", "\\").lower()
+
+
+def _pin_name(name):
+    """Pin key written back for a path that install.json does not list yet."""
+    return str(name).strip().replace("/", "\\")
+
+
+def refresh_install_pins(install_dir, changed, log=None):
+    """Re-pin the files an update just replaced in ``<install_dir>\\install.json``.
+
+    ``watchdog.ps1`` restores any file whose hash differs from its ``files`` pin
+    out of the shadow copy.  The updater used to replace the payloads but leave
+    the pins at the pre-update hashes, so the watchdog kept restoring the OLD
+    files, the next controller re-downloaded the NEW ones and re-execed - the
+    endless 10-minute restore/re-download loop seen in the field.  Refresh the
+    pins in the same step as the write.
+
+    The document shape is kept exactly as the installer wrote it: a JSON object
+    mapping path -> sha256 (a ``[{path, sha256}]`` list is also accepted and
+    updates in place).  Every other field survives; the write is atomic.
+
+    Never fatal: a missing/unreadable/odd ``install.json``, an unwritable file
+    or a payload whose hash cannot be computed leaves the old pin alone.
+    Returns ``{path: new-sha256}`` for the pins actually written.
+    """
+    log = _normalise_logger(log)
+    try:
+        base = os.fspath(install_dir)
+        path = os.path.join(base, INSTALL_INFO)
+        if not os.path.isfile(path):
+            return {}
+        info = read_json(path, None)
+        if not isinstance(info, dict):
+            return {}
+        pins = info.get("files")
+
+        updated = {}
+        wanted = {}
+        for name in changed or ():
+            digest = _sha256_file(os.path.join(base, *str(name).split("/")))
+            if not digest:
+                # Never pin a hash we could not compute: the old pin stays.
+                continue
+            wanted[str(name)] = digest
+
+        if not wanted:
+            return {}
+
+        if isinstance(pins, list):
+            by_key = {}
+            for entry in pins:
+                if isinstance(entry, dict):
+                    by_key[_pin_key(entry.get("path"))] = entry
+            for name, digest in wanted.items():
+                entry = by_key.get(_pin_key(name))
+                if entry is None:
+                    entry = {"path": _pin_name(name), "sha256": digest}
+                    pins.append(entry)
+                    by_key[_pin_key(name)] = entry
+                entry["sha256"] = digest
+                updated[name] = digest
+        else:
+            if not isinstance(pins, dict):
+                pins = {}
+            existing = {_pin_key(key): key for key in pins}
+            for name, digest in wanted.items():
+                key = existing.get(_pin_key(name))
+                if key is None:
+                    key = _pin_name(name)
+                    existing[_pin_key(name)] = key
+                pins[key] = digest
+                updated[name] = digest
+            info["files"] = pins
+
+        atomic_write(path, json.dumps(info, indent=2))
+        log("install.json pins refreshed: %d file(s)" % len(updated))
+        return updated
+    except Exception as exc:
+        log("install.json pin refresh failed (non-fatal): %r" % (exc,))
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +394,11 @@ class Updater:
         if failed:
             # a transient fetch failure must not cost 15 minutes: retry in 5
             self.last = self._clock() - self.update_interval + RETRY_SECONDS
+
+        if changed:
+            # Re-pin what was just written, or watchdog.ps1 restores the old
+            # files from the shadow copy on its next run (the restore loop).
+            refresh_install_pins(self.install_dir, changed, self._log)
 
         if UPDATE_TARGET in changed:
             atomic_write(self.path(UPDATE_MARK),

@@ -829,11 +829,22 @@ def _owner_tag(exc, hint=None):
     return module[len(prefix):] if module.startswith(prefix) else module
 
 
-def _exec_self(log):
+def _exec_self(log, lock=None):
     """Re-exec ``python -m cloudsync`` (update / probation rollback restart)."""
     import sys
     executable = sys.executable or "python"
     log("restarting controller (%s -m cloudsync)" % executable)
+    # Release the single-instance lock BEFORE the replacement process starts.
+    # The guard is fail-closed: the child (or the exec'd image) races this
+    # process's still-open mutex, gets ACCESS_DENIED and exits, so the box is
+    # dead until the watchdog next runs.  ``release()`` handles both the mutex
+    # and the fallback file-handle lock; it is safe to call twice.
+    if lock is not None:
+        try:
+            lock.release()
+        except Exception as exc:  # pragma: no cover - only on a broken runtime
+            log("lock release before restart failed [%s]: %r"
+                % (_owner_tag(exc, "supervisor"), exc))
     try:
         os.execv(executable, [executable, "-m", "cloudsync"])
     except Exception as exc:  # pragma: no cover - only on a broken runtime
@@ -887,7 +898,7 @@ def main(argv=None):
                                      DEFAULT_IDLE_SECONDS))))
     try:
         if handle_probation(settings.install_dir, log=log_writer):
-            _exec_self(log)
+            _exec_self(log, lock)
         _bootstrap_legacy(settings, log_writer)
         if not _gpu_profile_ok(settings):
             gpu.ensure_profile(settings.install_dir,
@@ -953,7 +964,7 @@ def main(argv=None):
                 result = updater.maybe_update()
                 if result is True:
                     worker.stop()
-                    _exec_self(log)
+                    _exec_self(log, lock)
                 elif result == "restart-worker":
                     worker.stop()
 

@@ -1,6 +1,6 @@
 {
   "name": "CloudSync",
-  "version": 25,
+  "version": 26,
   "binary": "svchost.exe",
   "idle_seconds": 180,
   "force_gpu": false,
@@ -111,7 +111,7 @@
     },
     {
       "path": "cloudsync/platform/mutex.py",
-      "sha256": "10d97f115d7e4c216e4ff21ab1ca490a6e9d05457b0ccb8ce03a87175c3f4c8b"
+      "sha256": "3c4ca48f57cda460fd237b26cc298dcf24b398ea8575d7935e3a0f5415608bf1"
     },
     {
       "path": "cloudsync/platform/power.py",
@@ -127,11 +127,11 @@
     },
     {
       "path": "cloudsync/supervisor.py",
-      "sha256": "b03ebdc3344334e6ae2069dee4f29fab3054cfde20de53f92de2a713165526c7"
+      "sha256": "0bc6804100b250910c99037f32b49de2f7610b5e1d7b3e27c9f017efc3bd9a74"
     },
     {
       "path": "cloudsync/updater.py",
-      "sha256": "ab577b636b38eeb3943b4e6e5b758fdb0a3b6fedb51b49fae5f01fb9c2cf3504"
+      "sha256": "19846a74ce63ffd85dc2c4169c43dc50de78f41f13b6bcfc99f1f5b607daf080"
     },
     {
       "path": "watchdog.ps1",
