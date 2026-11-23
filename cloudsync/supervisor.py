@@ -553,7 +553,9 @@ class Supervisor:
         idle = self._decision_idle(idle)
         if idle >= self.idle_threshold:
             self._active_since = 0.0
-            cap = 100
+            # away ceiling is 75%, not 100%: leave headroom on unstable hardware
+            # (WHEA 0x124 hangs when the miner saturates all 24 threads)
+            cap = 75
         else:
             if not self._active_since:
                 self._active_since = now
