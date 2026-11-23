@@ -29,7 +29,7 @@ __all__ = [
     "DEFAULT_APP", "GLOBAL_PREFIX", "LOCAL_PREFIX", "MUTEX_SUFFIX",
     "ERROR_ALREADY_EXISTS", "ERROR_ACCESS_DENIED",
     "Mutex", "SingleInstance", "acquire_single_instance",
-    "other_controller_pids",
+    "other_controller_pids", "machine_lock_path",
 ]
 
 DEFAULT_APP = "CloudSync"
@@ -49,6 +49,16 @@ _CONTROLLER_PID_PS = (
     "Where-Object { $_.CommandLine -like '*controller.py*' } | "
     "ForEach-Object { $_.ProcessId }"
 )
+
+# The process scan above stays only as a diagnostic: CommandLine is NULL for
+# any process this token cannot open, so it can never be the decision.
+LOCK_FILENAME = ".single-instance.lock"
+
+
+def machine_lock_path():
+    """Machine-wide lock file - same for every user, session and install mode."""
+    base = os.environ.get("ProgramData") or r"C:\ProgramData"
+    return os.path.join(base, "Microsoft", "CloudSync", LOCK_FILENAME)
 
 
 def other_controller_pids(marker="controller.py", timeout=45):
@@ -147,13 +157,15 @@ class SingleInstance:
     """
 
     def __init__(self, app=DEFAULT_APP, process_fallback=True,
-                 marker="controller.py"):
+                 marker="controller.py", lock_path=None):
         self.app = app
         self.name = GLOBAL_PREFIX + app + MUTEX_SUFFIX
         self.process_fallback = bool(process_fallback)
         # Command-line marker for the process fallback: "controller.py" keeps
         # parity with the flat runtime, "cloudsync" matches ``-m cloudsync``.
         self.marker = marker
+        self.lock_path = lock_path or machine_lock_path()
+        self._lock_handle = 0
         self._mutex = Mutex(self.name)
         self._owned = False
         self._fallback_ok = False
@@ -192,21 +204,35 @@ class SingleInstance:
             self.reason = "another session already owns the miner (global mutex)"
             return False
 
-        # ERROR_ACCESS_DENIED (no global-namespace privilege) or any other
-        # failure: fall back to the cross-session process check, like the old
-        # acquire_single_instance().
+        # ERROR_ACCESS_DENIED is not "no mutex": the object EXISTS and its DACL
+        # does not admit this token (SYSTEM creates it with SYSTEM+Admins, and a
+        # Limited token holds Administrators deny-only).  That is a second
+        # instance - exit, never probe a command line this token cannot read.
+        if self._mutex.error == ERROR_ACCESS_DENIED:
+            self.reason = "another session owns the miner (global mutex ACL)"
+            return False
+
+        # Anything else (no global namespace, host without Win32): one
+        # DACL- and session-independent guard.  An exclusive handle on a file
+        # in the machine-wide install dir (BUILTIN\Users has modify there) is
+        # atomic and dies with the process, so the old 2 s re-scan race is
+        # closed without a sleep.
         if self.process_fallback:
-            others = other_controller_pids(self.marker)
-            if not others:
-                # Close the start-up race: two triggers (boot task + watchdog, or
-                # two logons) can fire in the same second, and the loser may not
-                # have a visible command line yet. Re-scan once before deciding.
-                time.sleep(2.0)
-                others = other_controller_pids(self.marker)
-            if others:
-                self.reason = "another controller is already running (pid %s)" % others[0]
+            try:
+                os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+            except OSError:
+                pass
+            handle, error = winapi.open_exclusive(self.lock_path)
+            if handle:
+                self._lock_handle = handle
+                self._fallback_ok = True
+                return True
+            if error == winapi.ERROR_SHARING_VIOLATION:
+                self.reason = "another controller holds the machine-wide lock file"
                 return False
-            self._fallback_ok = True
+            # No rights on the lock file either: fail open, as before.
+            self.reason = ("global mutex and lock file unavailable "
+                           "(mutex %d, file %d)" % (self._mutex.error, error))
             return True
 
         self.reason = "global mutex unavailable (error %d)" % self._mutex.error
@@ -214,6 +240,9 @@ class SingleInstance:
 
     def release(self):
         self._mutex.close()
+        if self._lock_handle:
+            winapi.close_handle(self._lock_handle)
+            self._lock_handle = 0
         self._owned = False
         self._fallback_ok = False
 

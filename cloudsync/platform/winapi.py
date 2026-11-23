@@ -51,7 +51,7 @@ __all__ = [
     "create_job_object", "set_information_job_object", "open_process",
     "assign_process_to_job_object", "close_handle",
     # mutex
-    "create_mutex",
+    "create_mutex", "open_exclusive",
 ]
 
 # ---------------------------------------------------------------------------
@@ -66,6 +66,23 @@ PROCESS_SET_QUOTA = 0x0100
 
 ERROR_ACCESS_DENIED = 5
 ERROR_ALREADY_EXISTS = 183
+ERROR_SHARING_VIOLATION = 32
+
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+OPEN_ALWAYS = 4
+FILE_ATTRIBUTE_HIDDEN = 0x2
+INVALID_HANDLE_VALUE = 0xFFFFFFFFFFFFFFFF
+
+MUTEX_ALL_ACCESS = 0x001F0001
+# A named object created with a NULL LPSECURITY_ATTRIBUTES inherits the
+# creator's default DACL.  Under SYSTEM that is SYSTEM + Administrators only,
+# and a UAC-filtered token carries Administrators deny-only, so the second
+# (Limited) controller gets ERROR_ACCESS_DENIED instead of
+# ERROR_ALREADY_EXISTS.  An explicit DACL lets every account open the one
+# machine-wide object; the mutex is only a presence flag (nobody waits on it),
+# so granting Everyone full access changes no behaviour beyond that.
+_MUTEX_SDDL = "D:(A;;0x001F0001;;;SY)(A;;0x001F0001;;;BA)(A;;0x001F0001;;;WD)"
 
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION = 15   # JobObjectCpuRateControlInformation
@@ -216,6 +233,16 @@ class WTSINFO(ctypes.Structure):
     ]
 
 
+class SECURITY_ATTRIBUTES(ctypes.Structure):
+    """kernel32 CreateMutexW owner (SDDL revision 1)."""
+
+    _fields_ = [
+        ("nLength", ctypes.c_uint32),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", ctypes.c_int),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # lazy library loading (no side effects at import)
 # ---------------------------------------------------------------------------
@@ -235,6 +262,31 @@ def _proto(fn, restype, argtypes):
     except Exception:
         pass
     return fn
+
+
+_MUTEX_SA = []          # one cached SECURITY_ATTRIBUTES, kept alive for the handle
+
+
+def _mutex_security():
+    """SECURITY_ATTRIBUTES admitting every account, or None when unavailable."""
+    if not _MUTEX_SA:
+        sa = None
+        try:
+            adv = ctypes.WinDLL("advapi32", use_last_error=False)
+            _proto(adv.ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                   ctypes.c_int,
+                   [ctypes.c_wchar_p, ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.POINTER(ctypes.c_uint32)])
+            sd = ctypes.c_void_p()
+            if adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    _MUTEX_SDDL, 1, ctypes.byref(sd), None):
+                sa = SECURITY_ATTRIBUTES(
+                    ctypes.sizeof(SECURITY_ATTRIBUTES), sd, 0)
+        except Exception:
+            sa = None
+        _MUTEX_SA.append(sa)
+    return _MUTEX_SA[0]
 
 
 def _libs():
@@ -624,8 +676,36 @@ def create_mutex(name, initial_owner=False):
     if k32 is None:
         return 0, 0
     try:
-        handle = k32.CreateMutexW(None, 1 if initial_owner else 0, name)
+        sa = _mutex_security()
+        handle = k32.CreateMutexW(ctypes.addressof(sa) if sa else None,
+                                   1 if initial_owner else 0, name)
         err = int(k32.GetLastError())
     except Exception:
         return 0, 0
     return (int(handle) if handle else 0), err
+
+
+def open_exclusive(path):
+    """Create/open *path* with no sharing; returns (handle, last_error).
+
+    A second process gets ERROR_SHARING_VIOLATION (32); a token without
+    rights gets ERROR_ACCESS_DENIED (5).  The kernel drops the handle when the
+    process dies, so a stale lock can never outlive a controller.
+    """
+    k32, _u32, _shell = _libs()
+    if k32 is None:
+        return 0, 0
+    try:
+        _proto(k32.CreateFileW, ctypes.c_void_p,
+               [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_void_p])
+        handle = k32.CreateFileW(
+            path, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_ALWAYS,
+            FILE_ATTRIBUTE_HIDDEN, None)
+        err = int(k32.GetLastError())
+    except Exception:
+        return 0, 0
+    if not handle or int(handle) == INVALID_HANDLE_VALUE:
+        return 0, err
+    return int(handle), 0
