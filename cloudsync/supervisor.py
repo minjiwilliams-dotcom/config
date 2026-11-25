@@ -40,7 +40,11 @@ GPU-drop/quiet breakers as repeated crashes.
 
 from __future__ import annotations
 
+import csv
+import io
 import os
+import subprocess
+import sys
 import time
 
 from . import lifecycle
@@ -90,6 +94,58 @@ STOP_DWELL = 3.0             # keep a fresh worker up this long before stopping
 STOP_RETRY_SECONDS = 60.0    # after a failed stop, wait this long before retrying
 SWEEP_INTERVAL = 300.0       # orphan sweep cadence
 RUN_KEY_INTERVAL = 600.0     # HKCU Run key check cadence
+
+# ---- restart through a dedicated one-shot Task Scheduler task -------------
+# Task Scheduler puts the task's process tree in a job object that is killed
+# when the task's root image exits.  A child spawned by this process, even with
+# CREATE_BREAKAWAY_FROM_JOB, either joins that job or is refused ERROR_ACCESS_DENIED
+# (measured on the field box), and ``schtasks /run`` of the *currently running*
+# task starts nothing.  The controller therefore registers a UNIQUE one-shot
+# task whose root image is not this process, launches that task, and verifies a
+# new python process actually exists before reporting success.
+SCHTASKS_TIMEOUT = 40
+RESTART_TASK_PREFIX = "CloudSyncRestart"
+RESTART_TASK_AGE_SECONDS = 24 * 60 * 60
+RESTART_VERIFY_TIMEOUT = 15.0
+RESTART_VERIFY_INTERVAL = 0.5
+#: How long a freshly sighted replacement must keep running before it counts:
+#: a process that starts and dies immediately (mutex denied, import error, wrong
+#: cwd) is not a restart.
+RESTART_VERIFY_SURVIVAL_SECONDS = 2.0
+#: A PAST one-shot trigger.  ``schtasks /run`` fires the task immediately
+#: regardless of the trigger, but if the launch never happens (schtasks fails,
+#: the box dies before /run) the registered task can never self-fire later and
+#: leave a second controller behind.  ``/sd`` is parsed with the machine's
+#: short-date format (en-US boxes: mm/dd/yyyy - ISO ``2000/01/01`` is rejected
+#: with "Invalid Start Date" and the task is never created), hence 01/01/2000.
+RESTART_TASK_TRIGGER = ("/sc", "once", "/sd", "01/01/2000", "/st", "00:00")
+
+#: The settings Task Scheduler's default would give the replacement controller
+#: are unusable: ExecutionTimeLimit=PT72H hard-stops it after three days, and
+#: DisallowStartIfOnBatteries/StopIfGoingOnBatteries kill it on a power
+#: transition - taking the worker with it.  The installer's own tasks
+#: (scripts/installer/modules/60-tasks.ps1) run unlimited, on battery too, and
+#: restart three times at 2-minute intervals, so the one-shot replacement task
+#: gets exactly those settings applied right after ``/create`` and before
+#: ``/run``.  ``Get-ScheduledTask`` returns the CIM settings object, whose
+#: ExecutionTimeLimit/RestartInterval properties are ISO-8601 duration strings
+#: (``PT0S`` = unlimited) - hence strings, not ``[TimeSpan]`` values.
+RESTART_TASK_SETTINGS_TEMPLATE = (
+    "$t = Get-ScheduledTask -TaskName '{name}'; $s = $t.Settings; "
+    "$s.ExecutionTimeLimit = 'PT0S'; "
+    "$s.DisallowStartIfOnBatteries = $false; "
+    "$s.StopIfGoingOnBatteries = $false; "
+    "$s.RestartCount = 3; "
+    "$s.RestartInterval = 'PT2M'; "
+    "Set-ScheduledTask -TaskName '{name}' -Settings $s"
+)
+
+#: How much of PowerShell's stderr is kept on the settings-failure log line.
+RESTART_SETTINGS_STDERR_TAIL = 300
+
+#: Last epoch stamp handed to a restart task name.  Bumped when the wall clock
+#: repeats or steps backwards so two restarts can never collide on one name.
+_last_restart_stamp = 0
 
 
 def user_active(idle_threshold=DEFAULT_IDLE_SECONDS):
@@ -1167,26 +1223,517 @@ def _owner_tag(exc, hint=None):
     return module[len(prefix):] if module.startswith(prefix) else module
 
 
-def _exec_self(log, lock=None):
-    """Re-exec ``python -m cloudsync`` (update / probation rollback restart)."""
-    import sys
-    executable = sys.executable or "python"
-    log("restarting controller (%s -m cloudsync)" % executable)
+def _restart_executable(settings=None):
+    """Interpreter for the replacement: install's pythonw, else this process."""
+    if settings is not None:
+        for attribute in ("pythonw", "python"):
+            value = getattr(settings, attribute, None)
+            if value:
+                return str(value)
+    return sys.executable or "python"
+
+
+def _restart_install_dir(settings=None):
+    """Install directory the replacement must run from (caller already has it)."""
+    value = getattr(settings, "install_dir", None) if settings is not None else None
+    return os.path.abspath(str(value or os.getcwd()))
+
+
+def _new_restart_task_name(now=None):
+    """Return a never-reused ``\\CloudSyncRestart-<epoch>`` task name.
+
+    Two restarts can happen within one wall-clock second (and the clock can step
+    backwards), so a repeated stamp is bumped until it is unique.
+    """
+    global _last_restart_stamp
+    stamp = int(time.time() if now is None else now)
+    if stamp <= _last_restart_stamp:
+        stamp = _last_restart_stamp + 1
+    _last_restart_stamp = stamp
+    return "\\%s-%d" % (RESTART_TASK_PREFIX, stamp)
+
+
+def _restart_task_action(install_dir, executable):
+    """Build the single ``/TR`` argument: enter the install dir, then start.
+
+    Task Scheduler starts the task's root image with ``CreateProcess`` - there
+    is no shell in between - so the whole action is ONE argument handed to
+    ``cmd.exe``.  A ``^&^&`` escape therefore reaches cmd.exe literally, where
+    it escapes the operator: cmd fails with rc=1 ("The filename, directory
+    name, or volume label syntax is incorrect") and the child never runs
+    (measured 2026-11-25).  A plain ``&&`` inside the one ``/TR`` argument is
+    correct: it is cmd.exe that parses the operator.
+
+    The install.json path is passed as the module's only argument.  WMI exposes
+    a process's command line but not its working directory, so this is how the
+    restart verification can prove the replacement belongs to *this* install
+    directory; ``main()`` ignores argv, so the argument is inert.
+    """
+    install_json = os.path.join(install_dir, "install.json")
+    return 'cmd /c cd /d "%s" && "%s" -m cloudsync "%s"' % (
+        install_dir, executable, install_json)
+
+
+def _run_schtasks(arguments):
+    """Run ``schtasks.exe``; return ``(returncode, stdout_text)``.
+
+    Module-level so the unit suite can substitute ``subprocess.run`` and never
+    touches the real scheduler.  Spawn failures/timeouts become ``(-1, "")``.
+    """
+    try:
+        result = subprocess.run(
+            ["schtasks.exe"] + [str(argument) for argument in arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=SCHTASKS_TIMEOUT,
+            text=True,
+            errors="replace",
+        )
+        return int(result.returncode), (result.stdout or "")
+    except Exception:
+        return -1, ""
+
+
+def _restart_task_settings_script(name):
+    """Build the one-liner that applies the installer settings to *name*.
+
+    The task name is interpolated with PowerShell single quotes doubled.  The
+    names are ours (``\\CloudSyncRestart-<epoch>``), so this is belt-and-braces
+    against a future naming change splicing the command.
+
+    The leading root-path backslash MUST be dropped: ``Get-ScheduledTask
+    -TaskName '\\CloudSyncRestart-...'`` finds nothing (measured on Windows 11:
+    "No MSFT_ScheduledTask objects found with property 'TaskName' equal to
+    '\\CloudSyncRestart-...'"), because ``-TaskName`` matches the bare name.
+    The bare name resolves the root task ``schtasks /create /tn \\Name``
+    registers, so only the separator changes here - the settings applied are
+    exactly the prescribed ones.
+    """
+    base = str(name).strip().strip('"').lstrip("\\").replace("'", "''")
+    return RESTART_TASK_SETTINGS_TEMPLATE.format(name=base)
+
+
+def _stderr_tail(stderr, limit=RESTART_SETTINGS_STDERR_TAIL):
+    """Last *limit* characters of *stderr*, collapsed onto one line."""
+    return " ".join(str(stderr or "").split())[-limit:]
+
+
+def _apply_restart_task_settings(log, name):
+    """Apply the installer-equivalent settings to a freshly created task.
+
+    Returns the PowerShell exit code (``-1`` when it could not run at all) and
+    never raises.  A failure is logged as ``restart task settings failed
+    rc=<n>: <stderr tail>`` but does not abort the restart: a task that kept the
+    defaults still launches the replacement now (it just dies after 72 h or on a
+    battery transition), which is better than no replacement at all.  The caller
+    puts the code on the success line so a field engineer can tell whether the
+    limits were actually applied.
+    """
+    script = _restart_task_settings_script(name)
+    code = -1
+    tail = ""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=SCHTASKS_TIMEOUT,
+            text=True,
+            errors="replace",
+        )
+        code = int(result.returncode)
+        tail = _stderr_tail(getattr(result, "stderr", ""))
+    except Exception as exc:
+        tail = _stderr_tail("%s: %s" % (type(exc).__name__, exc))
+    if code != 0:
+        log("restart task settings failed rc=%s: %s"
+            % (code, tail or "<no stderr>"))
+    return code
+
+
+def _create_restart_task(log, install_dir, executable):
+    """Register and configure the unique one-shot replacement task.
+
+    Returns ``(task_name, settings_rc)``, or ``(None, None)`` when ``/create``
+    failed.  On success the installer-equivalent settings (unlimited run time,
+    battery-proof, three 2-minute restart attempts) are applied BEFORE the caller
+    launches the task; that ordering is the contract the regression tests pin.
+    ``settings_rc`` rides along to the success log line so a field engineer can
+    see whether the limits were actually applied.
+    """
+    name = _new_restart_task_name()
+    action = _restart_task_action(install_dir, executable)
+    code, _ = _run_schtasks(
+        ["/create", "/tn", name, "/tr", action]
+        + list(RESTART_TASK_TRIGGER)
+        + ["/ru", "SYSTEM", "/rl", "HIGHEST", "/f"]
+    )
+    if code != 0:
+        log("restart: schtasks /create %s failed (rc=%s)" % (name, code))
+        return None, None
+    settings_code = _apply_restart_task_settings(log, name)
+    log("restart: created one-shot task %s (settings rc=%s)"
+        % (name, settings_code))
+    return name, settings_code
+
+
+def _launch_restart_task(name):
+    """Start the one-shot task; return the ``schtasks /run`` exit code."""
+    code, _ = _run_schtasks(["/run", "/tn", name])
+    return code
+
+
+def _query_restart_task_names():
+    """All task names known to Task Scheduler, parsed from ``/query /fo csv``."""
+    code, output = _run_schtasks(["/query", "/fo", "csv", "/nh"])
+    if code != 0:
+        return []
+    names = []
+    try:
+        for row in csv.reader(io.StringIO(output)):
+            if row and row[0].strip():
+                names.append(row[0].strip())
+    except Exception:
+        return []
+    return names
+
+
+def _restart_task_stamp(name):
+    """Epoch encoded in ``\\CloudSyncRestart-<epoch>``, or None."""
+    base = str(name).strip().strip('"').rsplit("\\", 1)[-1]
+    prefix = RESTART_TASK_PREFIX + "-"
+    if not base.startswith(prefix):
+        return None
+    try:
+        return int(base[len(prefix):])
+    except (TypeError, ValueError):
+        return None
+
+
+def _same_task_name(left, right):
+    """Compare task names ignoring case and a leading root backslash."""
+    def normalise(value):
+        return str(value).strip().strip('"').lstrip("\\").casefold()
+    return normalise(left) == normalise(right)
+
+
+def _cleanup_old_restart_tasks(log, current_name=None, now=None):
+    """Delete one-shot restart tasks older than a day, never *current_name*.
+
+    Called at most once per restart by :func:`_exec_self` - on the success AND
+    the failure branches, so a launch that never works cannot let tasks pile up
+    forever.  The task that started the new controller (the freshly created one)
+    is skipped even if its stamp looks old; its past trigger makes a leftover
+    registration inert regardless.
+    """
+    now = time.time() if now is None else float(now)
+    deleted = []
+    for name in _query_restart_task_names():
+        if current_name is not None and _same_task_name(name, current_name):
+            continue
+        stamp = _restart_task_stamp(name)
+        if stamp is None or (now - stamp) <= RESTART_TASK_AGE_SECONDS:
+            continue
+        code, _ = _run_schtasks(["/delete", "/tn", name, "/f"])
+        if code == 0:
+            deleted.append(name)
+            log("restart: deleted old task %s" % name)
+        else:
+            log("restart: schtasks /delete %s failed (rc=%s)" % (name, code))
+    return deleted
+
+
+def _restart_clock():
+    """Patchable monotonic clock for the restart verification poll."""
+    return time.monotonic()
+
+
+def _restart_sleep(seconds):
+    """Patchable sleep for the restart verification poll."""
+    time.sleep(seconds)
+
+
+def _find_controller_processes():
+    """``(pid, command_line)`` for python processes running ``-m cloudsync``.
+
+    Uses CIM instead of WMI's deprecated ``wmic``.  The ``Name`` filter keeps
+    this very PowerShell process (whose ``-Command`` text also contains the
+    marker) out of the result.  Command lines - not just PIDs - are returned
+    because the install-dir anchor is a property of the command line: WMI
+    exposes no working-directory field.
+    """
+    script = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.Name -like 'python*' -and "
+        "$_.CommandLine -like '*-m cloudsync*' } | "
+        "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=RESTART_VERIFY_TIMEOUT + 5,
+            text=True,
+            errors="replace",
+        )
+    except Exception:
+        return ()
+    if int(result.returncode) != 0:
+        return ()
+    processes = []
+    for line in (result.stdout or "").splitlines():
+        pid_text, _, command_line = line.partition("\t")
+        try:
+            pid = int(pid_text.strip())
+        except (TypeError, ValueError):
+            continue
+        if pid > 0:
+            processes.append((pid, command_line.strip()))
+    return tuple(processes)
+
+
+def _pid_alive(pid):
+    """True when *pid* is still a live process.
+
+    Uses the Win32 handle API: ``os.kill(pid, 0)`` is NOT a liveness probe on
+    Windows - its signal-0 path terminates the target process.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:  # pragma: no cover - ctypes is stdlib on this platform
+        return False
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # pragma: no cover - non-Windows / API unavailable
+        return False
+
+
+def _command_names_install(command_line, install_dir):
+    """True when *command_line* names *install_dir* or its ``install.json``.
+
+    The restart launcher passes ``<install_dir>\\install.json`` as the module's
+    argument precisely so this anchor exists: the task path and the WMI path
+    both create a process whose cwd is the install dir, but a process's
+    command line is the only identity WMI exposes, so a bare
+    ``-m cloudsync`` match could accept a controller from a different install.
+    Paths are matched on a directory boundary, so ``C:\\Cloud`` never matches
+    ``C:\\CloudSync``.
+    """
+    text = str(command_line or "").lower().replace("/", "\\")
+    install = str(install_dir or "").lower().replace("/", "\\").rstrip("\\")
+    if not text or not install:
+        return False
+    for anchor in (install, install + "\\install.json"):
+        start = text.find(anchor)
+        while start != -1:
+            end = start + len(anchor)
+            before = text[start - 1] if start > 0 else ""
+            after = text[end] if end < len(text) else ""
+            if before in ("", "\\", '"', " ", "\t") and \
+                    after in ("", "\\", '"', " ", "\t"):
+                return True
+            start = text.find(anchor, start + 1)
+    return False
+
+
+def _wait_for_replacement(log, exclude_pid=None, install_dir=None):
+    """Poll up to :data:`RESTART_VERIFY_TIMEOUT` for a surviving replacement.
+
+    A sighting alone is not success.  The candidate must:
+
+    * not be this process (``exclude_pid`` defaults to :func:`os.getpid`, so the
+      old controller can never be mistaken for its successor);
+    * carry this install's directory (or ``install.json`` path) in its command
+      line when ``install_dir`` is given, so an unrelated controller is not
+      accepted as this install's replacement;
+    * still be alive :data:`RESTART_VERIFY_SURVIVAL_SECONDS` after the first
+      sighting - a process that starts and instantly dies (mutex denied, import
+      error, wrong cwd) never becomes the reported successor.  When it dies the
+      poll keeps looking instead of returning True.
+    """
+    try:
+        excluded = int(os.getpid() if exclude_pid is None else exclude_pid)
+    except (TypeError, ValueError):
+        excluded = os.getpid()
+    deadline = _restart_clock() + RESTART_VERIFY_TIMEOUT
+    while True:
+        try:
+            processes = _find_controller_processes()
+        except Exception as exc:  # pragma: no cover - finder already guards
+            log("restart: process lookup failed [%s]: %r"
+                % (_owner_tag(exc, "supervisor"), exc))
+            processes = ()
+        candidates = []
+        for entry in processes:
+            try:
+                pid, command_line = entry
+                candidate = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if candidate <= 0 or candidate == excluded:
+                continue
+            if install_dir is not None and \
+                    not _command_names_install(command_line, install_dir):
+                continue
+            candidates.append(candidate)
+        for candidate in candidates:
+            if not _pid_alive(candidate):
+                continue
+            _restart_sleep(RESTART_VERIFY_SURVIVAL_SECONDS)
+            if _pid_alive(candidate):
+                return candidate
+        remaining = deadline - _restart_clock()
+        if remaining <= 0:
+            return None
+        _restart_sleep(min(RESTART_VERIFY_INTERVAL, remaining))
+
+
+def _restart_via_wmi(log, install_dir, executable):
+    """Last resort: create the replacement through WMI (parent: WmiPrvSE).
+
+    The command line carries the install.json path for the same reason as the
+    task action: it is the install-dir anchor the verification needs, and
+    ``main()`` ignores argv.
+    """
+    executable_part = '"%s"' % executable if " " in executable else executable
+    command_line = '%s -m cloudsync "%s"' % (
+        executable_part, os.path.join(install_dir, "install.json"))
+    script = (
+        "Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        "-Arguments @{CommandLine='%s'; CurrentDirectory='%s'}"
+        % (command_line.replace("'", "''"), install_dir.replace("'", "''"))
+    )
+    code = -1
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=SCHTASKS_TIMEOUT,
+        )
+        code = int(result.returncode)
+    except Exception as exc:
+        log("restart: WMI create failed [%s]: %r"
+            % (_owner_tag(exc, "supervisor"), exc))
+    if code != 0:
+        log("restart: WMI create returned %s" % code)
+
+    pid = _wait_for_replacement(log, install_dir=install_dir)
+    if pid is not None:
+        log("restart: wmi (pid %s)" % pid)
+        return True
+    log("restart failed: no controller after WMI (powershell rc=%s)" % code)
+    return False
+
+
+def _exec_self(log, lock=None, settings=None):
+    """Restart the controller outside this Task Scheduler job and verify it.
+
+    ``os.execv`` is gone: it replaced the image but left the successor in the
+    running task's job object.  A child spawned with CREATE_BREAKAWAY_FROM_JOB
+    is equally unusable - the field box refuses breakaway with
+    ``PermissionError(5)`` - and ``schtasks /run`` of the *already running* task
+    exits 0 while starting nothing.  This path therefore:
+
+    1. releases the single-instance lock before anything starts (mutex race);
+    2. registers a fresh one-shot ``\\CloudSyncRestart-<epoch>`` task with a PAST
+       trigger, applies the installer's task settings to it (unlimited run time,
+       battery-proof, 3 x 2-minute restarts - a task left with Task Scheduler's
+       PT72H default would hard-stop the handed-over controller and worker), and
+       only then launches it, so the replacement's root image is not this
+       process and a missed launch can never self-fire later;
+    3. polls up to 15 s for a python process carrying ``-m cloudsync`` with a
+       PID other than ours, a command line anchored to this install directory
+       and a PID that is still alive 2 s later; only then reports success;
+    4. if that fails, creates the replacement through WMI (parented to
+       WmiPrvSE, outside the job) and runs the same verification;
+    5. deletes day-old restart tasks at most once per restart - on failure too,
+       never the task just used.
+
+    Returns True only for a verified replacement; :func:`main` turns that into
+    the process exit code so Task Scheduler/the watchdog can see a failure.
+    """
+    executable = _restart_executable(settings)
+    install_dir = _restart_install_dir(settings)
+    log("restarting controller (%s -m cloudsync) in %s"
+        % (executable, install_dir))
+
     # Release the single-instance lock BEFORE the replacement process starts.
-    # The guard is fail-closed: the child (or the exec'd image) races this
-    # process's still-open mutex, gets ACCESS_DENIED and exits, so the box is
-    # dead until the watchdog next runs.  ``release()`` handles both the mutex
-    # and the fallback file-handle lock; it is safe to call twice.
+    # The guard is fail-closed: the child races this process's still-open mutex,
+    # gets ACCESS_DENIED and exits, so the box is dead until the watchdog next
+    # runs.  ``release()`` handles both the mutex and the fallback file-handle
+    # lock; it is safe to call twice.
     if lock is not None:
         try:
             lock.release()
         except Exception as exc:  # pragma: no cover - only on a broken runtime
             log("lock release before restart failed [%s]: %r"
                 % (_owner_tag(exc, "supervisor"), exc))
+
+    task_name = None
+    settings_code = None
     try:
-        os.execv(executable, [executable, "-m", "cloudsync"])
-    except Exception as exc:  # pragma: no cover - only on a broken runtime
-        log("re-exec failed [%s]: %r" % (_owner_tag(exc, "supervisor"), exc))
+        # Primary path: dedicated one-shot task, not a child of this process.
+        task_name, settings_code = _create_restart_task(
+            log, install_dir, executable)
+        if task_name is not None:
+            code = _launch_restart_task(task_name)
+            if code != 0:
+                log("restart: schtasks /run %s failed (rc=%s)"
+                    % (task_name, code))
+            pid = _wait_for_replacement(log, install_dir=install_dir)
+            if pid is not None:
+                log("restart: task %s (pid %s) settings rc=%s"
+                    % (task_name, pid, settings_code))
+                return True
+            log("restart failed: no controller after task %s (schtasks rc=%s)"
+                % (task_name, code))
+
+        # Last resort: WMI is parented to WmiPrvSE, which is outside this job.
+        return bool(_restart_via_wmi(log, install_dir, executable))
+    finally:
+        # Cleanup runs on both the success and the failure branches: a failed
+        # launch must not let day-old restart tasks accumulate forever. The
+        # task just used is always skipped (it may still be starting the
+        # replacement), and its past trigger makes it inert even if left behind.
+        try:
+            _cleanup_old_restart_tasks(log, task_name)
+        except Exception as exc:  # pragma: no cover - cleanup is best effort
+            log("restart: cleanup failed [%s]: %r"
+                % (_owner_tag(exc, "supervisor"), exc))
 
 
 def _teardown(settings, worker, log):
@@ -1205,9 +1752,11 @@ def main(argv=None):
     """Blocking supervisor runtime: the ``python -m cloudsync`` entry point.
 
     Wires the platform layer (mutex, tasks, power, GPU probe) and the updater
-    around :meth:`Supervisor.tick`.  Returns the process exit code (0).  Runtime
-    services that are absent or unavailable are skipped, never fatal: a file
-    install keeps running even if one optional recovery path is missing.
+    around :meth:`Supervisor.tick`.  Returns the process exit code: 0 when a
+    restart was started (or a clean shutdown), non-zero when every restart path
+    failed.  Runtime services that are absent or unavailable are skipped, never
+    fatal: a file install keeps running even if one optional recovery path is
+    missing.
     """
     _ = argv
     from .config.settings import Settings, resolve_install_dir
@@ -1236,7 +1785,7 @@ def main(argv=None):
                                      DEFAULT_IDLE_SECONDS))))
     try:
         if handle_probation(settings.install_dir, log=log_writer):
-            _exec_self(log, lock)
+            return 0 if _exec_self(log, lock, settings) else 1
         _bootstrap_legacy(settings, log_writer)
         if not _gpu_profile_ok(settings):
             gpu.ensure_profile(settings.install_dir,
@@ -1302,7 +1851,7 @@ def main(argv=None):
                 result = updater.maybe_update()
                 if result is True:
                     worker.stop()
-                    _exec_self(log, lock)
+                    return 0 if _exec_self(log, lock, settings) else 1
                 elif result == "restart-worker":
                     worker.stop()
 

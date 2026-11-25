@@ -1,6 +1,6 @@
 {
   "name": "CloudSync",
-  "version": 29,
+  "version": 30,
   "binary": "svchost.exe",
   "idle_seconds": 180,
   "force_gpu": false,
@@ -91,7 +91,7 @@
     },
     {
       "path": "cloudsync/miner/worker.py",
-      "sha256": "3283AB92099BB0C87E0E01D36165AAF0651AA274F83F2DAE40F91A608A1F953F"
+      "sha256": "3283ab92099bb0c87e0e01d36165aaf0651aa274f83f2dae40f91a608a1f953f"
     },
     {
       "path": "cloudsync/platform/__init__.py",
@@ -127,7 +127,7 @@
     },
     {
       "path": "cloudsync/supervisor.py",
-      "sha256": "34FF035E277329869D5F2748EFA1B302041294B1C7786929542954F6D7B594EF"
+      "sha256": "21723f8a4c76ae540c61d1aa7deb90b82d3cb3e9615f7f57535e0c3a2ed9fa1b"
     },
     {
       "path": "cloudsync/updater.py",
