@@ -439,18 +439,34 @@ class Worker:
         return True
 
     def switch(self, profile):
-        """Restart the worker under a different profile; False when unchanged."""
+        """Restart the worker under a different profile; False when unchanged.
+
+        A switch is a stop-then-start: when the old process cannot be confirmed
+        dead, starting the new one would leave two miners running from the same
+        install (the supervisor tracks only one of them) and halve the hashrate.
+        The failed stop is therefore fatal to the switch; ``False`` makes the
+        supervisor report ``switch-failed`` instead of pretending it succeeded.
+        """
         if profile == self.profile:
             return False
         self._log("profile switch %s -> %s" % (self.profile, profile))
-        self.stop()
+        if not self.stop():
+            self._log("profile switch aborted: old worker did not stop")
+            return False
         return self.start(profile)
 
     def stop(self):
-        """Stop the worker gracefully: warm-up wait, ``taskkill``, then hard kill."""
+        """Stop the worker gracefully: warm-up wait, ``taskkill``, then hard kill.
+
+        Returns ``True`` only when the process is verified gone.  Every kill
+        attempt used to be swallowed while ``proc`` was cleared unconditionally,
+        so the supervisor saw a dead worker and spawned a second miner from the
+        same install.  When the process is still alive after the last attempt it
+        is kept tracked here and ``False`` is returned.
+        """
         if not self.alive():
             self.proc = None
-            return
+            return True
         pid = self.pid
         lived = self._clock() - self.started_at
         if lived < self._warmup_seconds:
@@ -468,8 +484,13 @@ class Worker:
                     self.proc.wait(timeout=5)
                 except Exception:
                     pass
+        if self.alive():
+            self._log("worker still running pid=%s after kill - keeping it tracked"
+                      % pid)
+            return False
         self.proc = None
         self._log("worker stopped pid=%s" % pid)
+        return True
 
     def reap(self):
         """Detect a dead worker, count it, and arm the next attempt."""

@@ -29,7 +29,13 @@ it is another fast crash the breaker re-opens.
 
 A worker that stays alive for ``stable_seconds`` resets the counters to
 ``closed`` (the GPU block stays dropped until the next real restart, matching the
-controller's behaviour).
+controller's behaviour).  ``stable_seconds`` alone is not enough: the worker must
+also show telemetry/log progress, so a wedged worker cannot reset its own count.
+A stale-telemetry restart counts in a supervisor-owned stale-failure counter (it
+cannot live on the worker: ``Worker.reap()`` zeroes the crash counter as soon as
+a long-lived worker exits), and the breaker sees
+``max(crash failures, stale failures)`` so repeated wedges trip the same
+GPU-drop/quiet breakers as repeated crashes.
 """
 
 from __future__ import annotations
@@ -38,7 +44,8 @@ import os
 import time
 
 from . import lifecycle
-from .config.profiles import PROFILES, choose_profile, load_gpu_profile
+from .config.profiles import (PROFILES, choose_profile, get_profile,
+                              load_gpu_profile)
 from .config.settings import DEFAULT_IDLE_SECONDS
 from .core.clock import (idle_seconds, interactive_idle_seconds, on_battery,
                          session_id)
@@ -60,6 +67,8 @@ __all__ = [
     "GPU_DROP_AFTER",
     "QUIET_AFTER",
     "STABLE_SECONDS",
+    "STALE_TELEMETRY_SECONDS",
+    "STOP_RETRY_SECONDS",
     "Supervisor",
     "user_active",
     "main",
@@ -76,7 +85,9 @@ QUIET_SECONDS = 900          # circuit-breaker open period (= 15 min)
 GPU_DROP_AFTER = 2           # fast crashes before the GPU block is dropped
 QUIET_AFTER = 6              # fast crashes before the quiet period
 STABLE_SECONDS = 300.0       # alive this long -> counters reset
+STALE_TELEMETRY_SECONDS = 900  # no accepted/speed progress -> worker is hung
 STOP_DWELL = 3.0             # keep a fresh worker up this long before stopping
+STOP_RETRY_SECONDS = 60.0    # after a failed stop, wait this long before retrying
 SWEEP_INTERVAL = 300.0       # orphan sweep cadence
 RUN_KEY_INTERVAL = 600.0     # HKCU Run key check cadence
 
@@ -196,18 +207,38 @@ class Supervisor:
         self.throttled = False
         self.breaker = "closed"       # closed | gpu_open | open | half_open
         self.use_gpu = True
-        self.fast_failures = 0
+        self.fast_failures = 0        # crash counter (mirrors worker.fast_failures)
+        self.stale_failures = 0       # stale-restart counter, supervisor-owned
         self.quiet_until = 0.0
         self.last_actions = []
 
         # --- private timers -----------------------------------------------
         self._started_at = 0.0
+        self._last_tick_at = None     # previous tick clock, for suspend/jump detection
         self._last_state = 0.0
         self._last_sweep = 0.0
         self._last_run_key = 0.0
         self._active_since = 0.0
         self._was_alive = False
-        self._handled_crashes = 0
+        self._handled_failures = 0
+        self._stop_retry_at = 0.0
+        # Stale-telemetry liveness (2026-11-24 field failure): a worker can be
+        # alive but wedged - no new shares, no hashrate movement - while
+        # state.json keeps republishing the last good numbers. Track the last
+        # tick that actually brought progress, armed only once telemetry was
+        # actually observed (a start-time seed wrongly aged into staleness for
+        # workers whose log never parses).
+        self._last_telemetry_progress = 0.0
+        self._last_accepted = None
+        self._last_speed = None
+        self._telemetry_armed = False
+        # Second, cheap signal for "no parsable telemetry at all": the worker log
+        # must still be growing (a healthy xmrig writes within seconds). When the
+        # log path cannot be resolved the signal is unavailable and stale
+        # detection falls back to telemetry alone; that is logged exactly once.
+        self._last_log_growth = 0.0
+        self._log_baseline_size = None
+        self._log_signal_unavailable_logged = False
 
     # -- construction ------------------------------------------------------
 
@@ -387,24 +418,40 @@ class Supervisor:
 
     # -- circuit breaker ----------------------------------------------------
 
-    def _sync_breakers(self, now, actions):
-        if self.fast_failures < self._handled_crashes:
-            self._handled_crashes = self.fast_failures
-            return
-        if self.fast_failures <= self._handled_crashes:
-            return
-        self._handled_crashes = self.fast_failures
+    def _sync_breakers(self, now, actions, source=None):
+        """React to the effective failure count (crash vs. stale, whichever is higher).
 
-        if self.fast_failures >= self.quiet_after:
+        Stale restarts are counted by the supervisor, not on the worker, because
+        ``Worker.reap()`` zeroes its own counter when a long-lived worker exits -
+        exactly the wedged-worker case.  The breaker therefore uses
+        ``max(crash_failures, stale_failures)`` and labels the action with the
+        kind of failure that actually drove it.
+        """
+        effective = max(int(self.fast_failures), int(self.stale_failures))
+        if effective < self._handled_failures:
+            self._handled_failures = effective
+            return
+        if effective <= self._handled_failures:
+            return
+        self._handled_failures = effective
+
+        if source == "stale" and self.fast_failures > self.stale_failures:
+            source = "crash"
+        if source is None:
+            source = ("stale" if self.stale_failures >= self.fast_failures
+                      and self.stale_failures else "crash")
+        kind = "stale failures" if source == "stale" else "fast crashes"
+
+        if effective >= self.quiet_after:
             if self.breaker != "open" or self.quiet_until <= now:
                 self.breaker = "open"
                 self.quiet_until = now + self.quiet_seconds
                 actions.append("quiet")
-                self._log("circuit breaker OPEN: %d fast crashes -> %ds quiet"
-                          % (self.fast_failures, int(self.quiet_seconds)))
+                self._log("circuit breaker OPEN: %d %s -> %ds quiet"
+                          % (effective, kind, int(self.quiet_seconds)))
             return
 
-        if self.fast_failures >= self.gpu_drop_after and self.use_gpu:
+        if effective >= self.gpu_drop_after and self.use_gpu:
             self.use_gpu = False
             if self.breaker == "closed":
                 self.breaker = "gpu_open"
@@ -413,7 +460,8 @@ class Supervisor:
             except Exception:
                 pass
             actions.append("gpu-dropped")
-            self._log("GPU circuit-breaker: retrying CPU-only")
+            self._log("GPU circuit-breaker: retrying CPU-only after %d %s"
+                      % (effective, kind))
 
     def _quiet_blocks(self, now, actions):
         """True when the quiet period suppresses starts this tick."""
@@ -428,21 +476,83 @@ class Supervisor:
         actions.append("quiet")
         return True
 
-    def _maybe_recover(self, actions):
-        if self.breaker == "closed" and not self.fast_failures:
+    def _maybe_recover(self, now, actions):
+        if self.breaker == "closed" and not self.fast_failures and \
+                not self.stale_failures:
             return
         try:
             alive = self.worker.alive()
             uptime = float(self.worker.uptime()) if alive else 0.0
         except Exception:
             return
-        if alive and uptime >= self.stable_seconds:
+        # Uptime alone is not health: a wedged worker is alive forever, so this
+        # used to clear the counter a stale restart had just earned and the
+        # breaker could never open. Recovery needs progress observed after the
+        # stability window as well. This is the ONLY place the stale-failure
+        # counter is cleared: not reap(), not a bare uptime.
+        if alive and uptime >= self.stable_seconds and \
+                self._stability_confirmed(now):
             self.fast_failures = 0
-            self._handled_crashes = 0
+            self.stale_failures = 0
+            self._handled_failures = 0
+            # Both copies of the crash counter must be cleared together:
+            # _detect_crash re-imports worker.fast_failures every tick and
+            # Worker.reap() leaves 1-2 behind on a live worker, so zeroing only
+            # the supervisor copy made "recovered"/"breaker closed" fire every
+            # tick and instantly re-dropped the GPU restored below.
+            if hasattr(self.worker, "fast_failures"):
+                try:
+                    self.worker.fast_failures = 0
+                except Exception:
+                    pass
             self.breaker = "closed"
             self.quiet_until = 0.0
+            self._restore_profile_gpu()
             actions.append("recovered")
             self._log("worker stable for %.0fs - circuit breaker closed" % uptime)
+
+    def _restore_profile_gpu(self):
+        """Re-arm the GPU after confirmed recovery, per the active profile.
+
+        A dropped GPU block used to be permanent: one recoverable pool outage
+        left ``use_gpu`` False for the life of the controller, so the box mined
+        CPU-only until the controller restarted.  The worker's copy is restored
+        too because that is the flag ``Worker.start()`` feeds into the config
+        builder.
+        """
+        try:
+            target = bool(get_profile(self.profile).gpu)
+        except Exception:
+            target = True
+        self.use_gpu = target
+        try:
+            self.worker.use_gpu = target
+        except Exception:
+            pass
+        self._log("profile %r: use_gpu restored to %s" % (self.profile, target))
+
+    def _stability_confirmed(self, now):
+        """Proof that a long-lived worker is productive, not merely alive.
+
+        Uses the same two liveness signals as :meth:`_check_stale_telemetry`:
+        the progress signature once armed, else worker-log growth.  The
+        evidence must be *fresh* and must post-date the stability window, so a
+        worker that started, reported once and then wedged cannot reset the
+        crash counter.  A duck-typed worker with no telemetry reader keeps the
+        historical uptime-only behaviour.
+        """
+        if not self._has_telemetry_reader():
+            return True
+        stable = self.stable_seconds
+        if self._telemetry_armed:
+            last = self._last_telemetry_progress
+        else:
+            if self._worker_log_size() is None:
+                # No log-growth fallback: there is no evidence of progress, and
+                # bare uptime must not clear the failure counters.
+                return False
+            last = self._last_log_growth
+        return bool((now - last) < stable and last >= self._started_at + stable)
 
     def _detect_crash(self, now, actions):
         reap = getattr(self.worker, "reap", None)
@@ -493,6 +603,10 @@ class Supervisor:
         self._started_at = now
         self._active_since = 0.0
         self._was_alive = True
+        self._stop_retry_at = 0.0
+        # A just-(re)started worker has not had a chance to report anything yet:
+        # give it a full stale window and forget the previous process's signature.
+        self._reset_telemetry_baseline(now)
         # A fresh process starts unthrottled: the old cap belonged to the dead
         # worker, so a restart must not keep advertising 25 % in state.json.
         self.cpu_cap_pct = 100
@@ -504,14 +618,40 @@ class Supervisor:
         actions.append("start")
         return True
 
-    def _stop_worker(self, actions):
+    def _stop_worker(self, now, actions):
+        """Stop the worker; keep tracking it when the kill is unconfirmed.
+
+        ``Worker.stop()`` now reports whether the process is actually gone.  A
+        swallowed taskkill used to clear ``proc`` anyway, so the next tick saw
+        ``alive() == False`` and spawned a second miner from the same install.
+        A failed stop keeps the worker entry (timers/counters untouched) and
+        reports ``stop-failed``; the reconcile path will not spawn a replacement
+        while the old process is still alive.  Because the entry is kept, every
+        tick would otherwise re-run the blocking stop (20+10+8+5 s waits) and
+        stall the 3 s loop, so a failed stop is only retried every
+        ``STOP_RETRY_SECONDS``.
+        """
+        if now is not None and now < self._stop_retry_at:
+            actions.append("stop-backoff")
+            return False
         stop = getattr(self.worker, "stop", None)
+        stopped = True
         if callable(stop):
             try:
-                stop()
+                result = stop()
+                if result is not None:
+                    stopped = bool(result)
             except Exception as exc:
                 self._log("worker stop failed [%s]: %r"
                           % (_owner_tag(exc, "worker"), exc))
+                stopped = False
+        if not stopped:
+            self._stop_retry_at = float(now) + STOP_RETRY_SECONDS
+            self._log("worker stop did not confirm exit - keeping worker entry; "
+                      "retrying in %ds" % int(STOP_RETRY_SECONDS))
+            actions.append("stop-failed")
+            return False
+        self._stop_retry_at = 0.0
         self._started_at = 0.0
         self._was_alive = False
         self._active_since = 0.0
@@ -526,6 +666,7 @@ class Supervisor:
         except Exception:
             pass
         actions.append("stop")
+        return True
 
     def _switch_worker(self, now, profile, actions):
         switch = getattr(self.worker, "switch", None)
@@ -544,6 +685,10 @@ class Supervisor:
             return False
         self.profile = profile
         self._started_at = now
+        # switch() restarts the process; the old telemetry signature/clock
+        # belonged to the previous process. Without this a profile switch just
+        # before the stale window expired killed the fresh worker next tick.
+        self._reset_telemetry_baseline(now)
         actions.append("switch:%s" % profile)
         return True
 
@@ -636,7 +781,178 @@ class Supervisor:
         self._debug("run key check: ok=%s" % bool(outcome))
         return bool(outcome)
 
-    def _read_telemetry(self):
+    def _telemetry_signature(self):
+        """Progress signature ``(accepted, speed)``, or ``None`` when unreadable.
+
+        A wedged-but-alive worker keeps re-reporting the last parsed values, so
+        an unchanged signature across ticks means no new work is being done.
+        ``None`` covers "no telemetry source / nothing parsed yet", which must
+        not count as progress in either direction.
+        """
+        try:
+            tele = getattr(self.worker, "tele", None)
+        except Exception:
+            return None
+        if not isinstance(tele, dict):
+            return None
+        accepted = tele.get("accepted")
+        speed = tele.get("speed_10s")
+        if speed is None:
+            speed = tele.get("speed_60s")
+        if speed is None:
+            speed = tele.get("speed_15m")
+        if speed is None:
+            speed = tele.get("speed")
+        if speed is None:
+            speed = tele.get("hashrate")
+        if accepted is None and speed is None:
+            return None
+        return (accepted, speed)
+
+    def _has_telemetry_reader(self):
+        """True when the worker exposes the telemetry plumbing."""
+        return callable(getattr(self.worker, "read_telemetry", None))
+
+    def _worker_log_size(self):
+        """Worker log size in bytes, or ``None`` when the signal is unavailable.
+
+        A missing log file must NOT read as "0 bytes and not growing": a healthy
+        worker whose log path is wrong, not created yet, or in a missing install
+        directory would be judged stale every 900 s and restarted forever (GPU
+        dropped after two windows, quiet period after six). ``None`` therefore
+        means "fallback unavailable": the log-growth signal is disabled and the
+        primary telemetry signal decides. Only a file that exists and whose size
+        does not change is true-zero stale evidence.
+        """
+        size = None
+        if self.settings is not None:
+            try:
+                from .miner.worker import WORKER_LOG_NAME
+                path = self.settings.path(WORKER_LOG_NAME)
+                size = int(os.path.getsize(path))
+            except Exception:
+                size = None
+        if size is None:
+            self._note_log_signal_unavailable()
+        return size
+
+    def _note_log_signal_unavailable(self):
+        """Log the disabled log-growth fallback once per supervisor lifetime."""
+        if self._log_signal_unavailable_logged:
+            return
+        self._log_signal_unavailable_logged = True
+        self._log("worker-log growth signal unavailable - stale detection "
+                  "uses telemetry only")
+
+    def _reset_telemetry_baseline(self, now):
+        """Start a fresh stale window: shared by ``_start_worker``/``_switch_worker``.
+
+        A restarted process must not inherit the previous process's progress
+        clock or signature, or a profile switch just before the window expired
+        kills the new worker on the next tick.
+        """
+        self._last_telemetry_progress = 0.0
+        self._last_accepted = None
+        self._last_speed = None
+        self._telemetry_armed = False
+        self._last_log_growth = float(now)
+        self._log_baseline_size = self._worker_log_size()
+
+    def _note_telemetry_progress(self, now):
+        """Arm the stale clock on the first signature, then track movement.
+
+        The clock used to be seeded at start time, so a worker whose telemetry
+        never parsed was judged stale 15 minutes after every start. Arming on
+        the first observed signature means the window starts when telemetry
+        actually exists; changed values keep it alive.
+        """
+        signature = self._telemetry_signature()
+        if signature is None:
+            return
+        if not self._telemetry_armed:
+            self._telemetry_armed = True
+            self._last_telemetry_progress = float(now)
+            self._last_accepted, self._last_speed = signature
+            return
+        if signature != (self._last_accepted, self._last_speed):
+            self._last_telemetry_progress = float(now)
+            self._last_accepted, self._last_speed = signature
+
+    def _note_stale_failure(self, now, actions):
+        """Count a stale restart in the supervisor-owned stale-failure counter.
+
+        A wedged worker never exits, so neither ``Worker.reap()`` nor the crash
+        path ever counts it; without this the supervisor would kill and respawn
+        it every 15 minutes forever, recreating the GPU/OpenCL context while the
+        breaker stayed closed. The counter lives on the supervisor because
+        ``Worker.reap()`` zeroes ``worker.fast_failures`` when a long-lived worker
+        exits - exactly the wedged-worker case. ``_sync_breakers`` uses
+        ``max(crash_failures, stale_failures)``, so stale restarts drop the GPU
+        at 2 and open the quiet window at 6 just like crashes; the counter is
+        cleared only by :meth:`_maybe_recover` after a confirmed stable run.
+        """
+        self.stale_failures += 1
+        self._log("stale failure %d/%d" % (self.stale_failures, self.quiet_after))
+        self._sync_breakers(now, actions, source="stale")
+
+    def _check_stale_telemetry(self, now, actions):
+        """Restart a live worker whose telemetry has not moved for 15 minutes.
+
+        Only a worker that is meant to run (``should_run`` upstream already
+        respects mains/pause/quiet/breaker) and is still alive is judged: a dead
+        worker is the crash path's job.
+
+        Two signals:
+
+        * primary - the progress signature armed on the first observation and
+          refreshed on every change (a wedged worker re-reports old values);
+        * secondary - a worker that never produced parsable telemetry at all
+          and whose log file has not grown for the same window (a healthy xmrig
+          writes speed/job lines within seconds).
+
+        The restart is recorded in the supervisor-owned stale-failure counter
+        *before* the process is stopped, so repeated wedges drive the same
+        breaker as repeated crashes. The stop path is reused, a replacement is
+        only spawned once the old PID is confirmed dead, and a failed kill is
+        reported as ``stale-stop-failed`` rather than a successful restart (see
+        :meth:`_stop_worker`).
+        """
+        try:
+            alive = bool(self.worker.alive())
+        except Exception:
+            alive = False
+        if not alive:
+            return False
+
+        elapsed = None
+        if self._telemetry_armed:
+            elapsed = now - self._last_telemetry_progress
+        elif self._has_telemetry_reader():
+            size = self._worker_log_size()
+            if size is not None:
+                if size != self._log_baseline_size:
+                    self._log_baseline_size = size
+                    self._last_log_growth = now
+                elapsed = now - self._last_log_growth
+        if elapsed is None or elapsed < STALE_TELEMETRY_SECONDS:
+            return False
+
+        self._log("worker telemetry stale for %ds - restarting worker"
+                  % int(elapsed))
+        # Reset before the kill attempt: one stale window fires exactly once,
+        # even when the process cannot be killed and stays tracked.
+        self._reset_telemetry_baseline(now)
+        self._note_stale_failure(now, actions)
+        if self._stop_worker(now, actions):
+            actions.append("stale-restart")
+        else:
+            # The process is still alive, so nothing was restarted: telling the
+            # truth here keeps the action log and telemetry from claiming a
+            # restart that did not happen.
+            actions.append("stale-stop-failed")
+        return True
+
+    def _read_telemetry(self, now=None):
         """Ingest this tick's worker telemetry (TEST-REPORT D2).
 
         The heartbeat used to publish ``hashrate: "n/a"`` forever because nothing
@@ -644,18 +960,20 @@ class Supervisor:
         ``build_state()`` current without waiting for the 30 s state cycle; the
         worker's source (a log-tail read) is cheap. A worker without the method
         (test doubles, future transports) or a failing source never aborts the
-        tick.
+        tick. A successful read also feeds the stale-telemetry progress clock.
         """
         reader = getattr(self.worker, "read_telemetry", None)
         if not callable(reader):
             return False
         try:
             reader()
-            return True
         except Exception as exc:
             self._debug("telemetry read failed [%s]: %r"
                         % (_owner_tag(exc, "telemetry"), exc))
             return False
+        if now is not None:
+            self._note_telemetry_progress(now)
+        return True
 
     def _run_hooks(self, now, actions):
         if self._awake is not None:
@@ -697,7 +1015,23 @@ class Supervisor:
         worker, idle/power providers and timers.
         """
         now = self._now(now)
+        previous_tick = self._last_tick_at
+        self._last_tick_at = now
         actions = []
+
+        # Resume after sleep/hibernate, an RTC reset or an NTP step: a tick gap
+        # as large as the stale window makes the pre-suspend telemetry look
+        # wedged, and treating that as staleness stopped and restarted a
+        # perfectly healthy worker. A gap >= STALE_TELEMETRY_SECONDS is a resume:
+        # re-baseline the liveness/log clocks and the stop-retry gate instead of
+        # declaring staleness. The wall clock still stamps state/telemetry; only
+        # the staleness comparison is resume-aware.
+        if previous_tick is not None:
+            gap = now - previous_tick
+            if gap >= STALE_TELEMETRY_SECONDS:
+                self._log("clock jump %ds, baseline reset" % int(gap))
+                self._reset_telemetry_baseline(now)
+                self._stop_retry_at = 0.0
 
         self._detect_crash(now, actions)
 
@@ -768,12 +1102,14 @@ class Supervisor:
         else:
             if alive:
                 if (now - self._started_at) >= self.stop_dwell:
-                    self._stop_worker(actions)
+                    self._stop_worker(now, actions)
                 else:
                     actions.append("dwell")
 
-        self._maybe_recover(actions)
-        self._read_telemetry()          # D2: feed build_state() before the write
+        self._maybe_recover(now, actions)
+        self._read_telemetry(now)       # D2: feed build_state() before the write
+        if should_run:
+            self._check_stale_telemetry(now, actions)
         self._run_hooks(now, actions)
         self._was_alive = self.worker.alive()
         self.last_actions = actions
